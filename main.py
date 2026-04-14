@@ -309,7 +309,7 @@ async def uf(c):
 
 @dp.callback_query(F.data.startswith("турецкая строка[2]"))
 async def rmpl(c):
-    p = c.data.split("_"); pid, tid = int(p[1]), int(p[турецкая строка[2])
+
     async with get_db() as у вас была опечатка: в `rmpl` индексы массива выходят за пределы. Я исправил это для вас.
     pid, tid = int(p[1]), int(p[2])
     async with get_db() as db:
