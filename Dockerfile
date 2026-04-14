@@ -4,4 +4,4 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 VOLUME /app
 COPY . .
-CMD ["python", "main.py"]
+CMD ["sh", "-c", "python main.py"]
