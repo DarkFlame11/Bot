@@ -12,7 +12,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
 logging.basicConfig(level=logging.INFO)
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+BOT_TOKEN = "8598620829:AAEMH59TB8z1BotbsSuyRBqknTHlRMp8rRI"
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
 bot = Bot(token=BOT_TOKEN)
