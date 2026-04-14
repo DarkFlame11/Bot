@@ -4,25 +4,33 @@ import asyncio
 import logging
 import aiosqlite
 from contextlib import asynccontextmanager
+from aiohttp import web
+
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import print
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.client.default import DefaultBotProperties
-# Corrected content of main.py that fixes all syntax errors
 
-logging.basicConfig(level=logging.info)
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Переменные окружения
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
-# Sample corrected code structure for demonstration
+if not BOT_TOKEN:
+    logging.error("Переменная BOT_TOKEN не задана!")
+    sys.exit(1)
 
-bot = Bot(token=telegram_token)
-dp = Dispatcher(storage=memory_storage())
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+
+# Инициализация бота и диспетчера
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+dp = Dispatcher(storage=MemoryStorage())
 DB_PATH = "database.db"
 
+# --- БАЗА ДАННЫХ ---
 @asynccontextmanager
 async def get_db():
     db = await aiosqlite.connect(DB_PATH)
@@ -41,22 +49,31 @@ async def init_db():
         await db.execute("CREATE TABLE IF NOT EXISTS playlists (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, name TEXT)")
         await db.execute("CREATE TABLE IF NOT EXISTS playlist_tracks (playlist_id INTEGER, track_id INTEGER, PRIMARY KEY(playlist_id, track_id))")
         await db.commit()
+    logging.info("✅ База данных инициализирована")
 
+# --- FSM ---
 class PlaylistForm(StatesGroup):
     waiting_name = State()
 
+# --- КЛАВИАТУРЫ ---
 menu = ReplyKeyboardMarkup(keyboard=[
     [KeyboardButton(text="🔍 Поиск"), KeyboardButton(text="🎲 Случайный")],
     [KeyboardButton(text="🔥 Топ"), KeyboardButton(text="❤️ Избранное")],
-    [KeyboardButton(text=" 리스트 Плейлистов")], ], resize_keyboard=True)
+    [KeyboardButton(text="📋 Список Плейлистов")], 
+], resize_keyboard=True)
 
-def clean_artist(a): return "" if a and a.startswith("@") else (a or "")
-def format_track(a, t): a = clean_artist(a); return f"{a} — {t}" if a else t
+def clean_artist(a): 
+    return "" if a and a.startswith("@") else (a or "")
+
+def format_track(a, t): 
+    a = clean_artist(a)
+    return f"{a} — {t}" if a else t
 
 def num_buttons(ids):
     d = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
     b = [InlineKeyboardButton(text=d[i], callback_data=f"track_{tid}") for i, tid in enumerate(ids)]
-    return InlineKeyboardMarkup(нline_keyboard=[b[i:i+5] for i in range(ilen(b), 5)])
+    # Исправлена ошибка с range и переменными
+    return InlineKeyboardMarkup(inline_keyboard=[b[i:i+5] for i in range(0, len(b), 5)])
 
 async def track_keyboard(tid, uid):
     async with get_db() as db:
@@ -65,19 +82,20 @@ async def track_keyboard(tid, uid):
     btn = InlineKeyboardButton(text="💔 Убрать" if inf else "❤️ В избранное", callback_data=f"unfav_{tid}" if inf else f"fav_{tid}")
     return InlineKeyboardMarkup(inline_keyboard=[[btn], [InlineKeyboardButton(text="➕ В плейлист", callback_data=f"topl_{tid}")]])
 
+# --- ТРАНСЛИТЕРАЦИЯ И ПОИСК ---
 CYR_LAT = {'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'yo','ж':'zh','з':'z','и':'i','й':'y','к':'k','л':'l','м':'m','н':'n','о':'o','п':'p','р':'р','с':'s','т':'t','у':'u','ф':'f','х':'kh','ц':'ts','ч':'ch','ш':'sh','щ':'shch','ъ':'','ы':'y','ь':'','э':'e','ю':'yu','я':'ya','дж':'j'}
 LAT_CYR = {"shch":"щ","sh":"ш","ch":"ч","zh":"ж","ts":"ц","yu":"ю","ya":"я","kh":"х","yo":"ё","a":"а","b":"б","v":"в","g":"г","d":"д","e":"е","z":"з","i":"и","y":"и","k":"к","l":"л","m":"м","n":"н","o":"о","p":"п","r":"р","s":"с","t":"т","u":"у","f":"ф","w":"в","x":"кс","j":"дж","h":"х"}
 
 def translit(t, m):
     r = t.lower()
-    for k, v in sorted(m.items(), key=lambda x: -len(x[0])): r = r.replace(k, v)
+    for k, v in sorted(m.items(), key=lambda x: -len(x[0])): 
+        r = r.replace(k, v)
     return r
 
 def get_var(q):
     q = "".join(str(q).lower().split())
     if not q: return []
     v = {q}
-    # Убираем невидимые спецсимволы, которые часто ломают поиск
     q = q.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '')
     lat = translit(q, CYR_LAT)
     if lat: v.add(lat)
@@ -96,7 +114,8 @@ async def run_search(query, limit=10):
         try:
             cur = await db.execute(sql, p); res = await cur.fetchall()
             if res: return res
-        except Exception as e: print(f"Err1: {e}")
+        except Exception as e: logging.error(f"Err1: {e}")
+        
         words = set()
         for v in var:
             for w in v.split():
@@ -115,18 +134,21 @@ async def run_search(query, limit=10):
                 if r[0] not in seen: seen.add(r[0]); comb.append(r)
                 if len(comb) >= limit: break
             return comb[:limit]
-        except Exception as e: print(f"Err2: {e}")
+        except Exception as e: logging.error(f"Err2: {e}")
     return []
 
+# --- ХЭНДЛЕРЫ ---
 @dp.message(Command("start"))
 async def start(m, state: FSMContext):
-    await state.clear(); await m.answer("🎧 Бот запущен", reply_markup=menu)
+    await state.clear()
+    await m.answer("🎧 Бот запущен", reply_markup=menu)
 
 @dp.channel_post(F.audio)
 async def save_track(m):
     t, a, f = m.audio.title or "Unknown", m.audio.performer or "Unknown", m.audio.file_id
     async with get_db() as db:
-        await db.execute("INSERT OR IGNORE INTO tracks (title, artist, file_id) VALUES (?,?,?)", (t,a,f)); await db.commit()
+        await db.execute("INSERT OR IGNORE INTO tracks (title, artist, file_id) VALUES (?,?,?)", (t,a,f))
+        await db.commit()
 
 @dp.message(F.audio)
 async def imp_track(m):
@@ -135,61 +157,76 @@ async def imp_track(m):
     async with get_db() as db:
         cur = await db.execute("SELECT 1 FROM tracks WHERE file_id=?", (f,))
         if await cur.fetchone(): await m.answer("⚠️ Уже есть"); return
-        await db.execute("INSERT INTO tracks (title, artist, file_id) VALUES (?,?,?)", (t,a,f)); await db.commit()
+        await db.execute("INSERT INTO tracks (title, artist, file_id) VALUES (?,?,?)", (t,a,f))
+        await db.commit()
     await m.answer(f"✅ Сохранено: {a} — {t}")
 
 @dp.message(F.text == "🎲 Случайный")
 async def rnd(m):
     async with get_db() as db:
-        cur = await db.execute("SELECT id, file_id FROM tracks ORDER BY RANDOM() LIMIT 1"); r = await cur.fetchone()
+        cur = await db.execute("SELECT id, file_id FROM tracks ORDER BY RANDOM() LIMIT 1")
+        r = await cur.fetchone()
         if not r: await m.answer("❌ Пусто"); return
-        await db.execute("UPDATE tracks SET plays=plays+1 WHERE id=?", (r[0],)); await db.commit()
+        await db.execute("UPDATE tracks SET plays=plays+1 WHERE id=?", (r[0],))
+        await db.commit()
     await m.answer_audio(r[1], reply_markup=await track_keyboard(r[0], m.from_user.id))
 
 @dp.message(F.text == "🔍 Поиск")
 async def sb(m, state: FSMContext):
-    await state.clear(); await m.answer("🔍 Пиши запрос:")
+    await state.clear()
+    await m.answer("🔍 Пиши запрос:")
 
 @dp.message(F.text == "❤️ Избранное")
 async def sf(m):
     async with get_db() as db:
-        cur = await db.execute("SELECT tracks.id, tracks.file_id FROM tracks JOIN favorites ON tracks.id=favorites.track_id WHERE favorites.user_id=?", (m.from_user.id,)); res = await cur.fetchall()
+        cur = await db.execute("SELECT tracks.id, tracks.file_id FROM tracks JOIN favorites ON tracks.id=favorites.track_id WHERE favorites.user_id=?", (m.from_user.id,))
+        res = await cur.fetchall()
         if not res: await m.answer("Пусто ❤️"); return
         for t in res:
             await db.execute("UPDATE tracks SET plays=plays+1 WHERE id=?", (t[0],))
-            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💔 Убрать", callback_data=f"unfav_{t[0]}")],[InlineKeyboardButton(text="➕ В плейлист", callback_data=f"topl_{t[0]}")]])
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💔 Убрать", callback_data=f"unfav_{t[0]}")],
+                [InlineKeyboardButton(text="➕ В плейлист", callback_data=f"topl_{t[0]}")]
+            ])
             await m.answer_audio(t[1], reply_markup=kb)
         await db.commit()
 
 @dp.message(F.text == "🔥 Топ")
 async def top(m):
     async with get_db() as db:
-        cur = await db.execute("SELECT artist, title, plays FROM tracks ORDER BY plays DESC LIMIT 10"); res = await cur.fetchall()
+        cur = await db.execute("SELECT artist, title, plays FROM tracks ORDER BY plays DESC LIMIT 10")
+        res = await cur.fetchall()
     if not res: await m.answer("❌ Пусто"); return
     md = ["🥇","🥈","🥉"]
     lines = [f"{md[i-1] if i<=3 else f'{i}.'} {format_track(t[0], t[1])} — {t[2]} 🎧" for i, t in enumerate(res, 1)]
-    await m.answer("🔥 <b>Топ:</b>\n\n" + "\n".join(lines), parse_mode="HTML")
+    await m.answer("🔥 <b>Топ:</b>\n\n" + "\n".join(lines))
 
 @dp.message(F.text == "📋 Список Плейлистов")
 async def spl(m, state: FSMContext):
     await state.clear()
     async with get_db() as db:
-        cur = await db.execute("SELECT id, name FROM playlists WHERE user_id=?", (m.from_user.id,)); res = await cur.fetchall()
-    rows = [[InlineKeyboardButton(text=f"📋 {p[1]}", callback_data=f"opl_{p[0]}"), InlineKeyboardButton(text="🗑", callback_data=f"delpl_{p[0]}")] for p in rows]
+        cur = await db.execute("SELECT id, name FROM playlists WHERE user_id=?", (m.from_user.id,))
+        res = await cur.fetchall()
+    # Исправлена ошибка рекурсии (было rows вместо res)
+    rows = [[InlineKeyboardButton(text=f"📋 {p[1]}", callback_data=f"opl_{p[0]}"), InlineKeyboardButton(text="🗑", callback_data=f"delpl_{p[0]}")] for p in res]
     rows.append([InlineKeyboardButton(text="➕ Создать", callback_data="plnew")])
     await m.answer("📋 Плейлисты:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 @dp.callback_query(F.data == "plnew")
 async def cpn(c, state: FSMContext):
-    await state.set_state(PlaylistForm.waiting_name); await c.message.answer("✏️ Название:"); await c.answer()
+    await state.set_state(PlaylistForm.waiting_name)
+    await c.message.answer("✏️ Название:")
+    await c.answer()
 
 @dp.message(PlaylistForm.waiting_name)
 async def rpn(m, state: FSMContext):
     n = m.text.strip()
     if not n or len(n)>50: await m.answer("❌ От 1 до 50 симв."); return
     async with get_db() as db:
-        await db.execute("INSERT INTO playlists (user_id, name) VALUES (?,?)", (m.from_user.id, n)); await db.commit()
-    await state.clear(); await m.answer(f"✅ «{n}» создан!")
+        await db.execute("INSERT INTO playlists (user_id, name) VALUES (?,?)", (m.from_user.id, n))
+        await db.commit()
+    await state.clear()
+    await m.answer(f"✅ «{n}» создан!")
 
 @dp.callback_query(F.data.startswith("delpl_"))
 async def dpl(c):
@@ -197,7 +234,9 @@ async def dpl(c):
     async with get_db() as db:
         cur = await db.execute("SELECT 1 FROM playlists WHERE id=? AND user_id=?", (pid, c.from_user.id))
         if not await cur.fetchone(): await c.answer("❌", show_alert=True); return
-        await db.execute("DELETE FROM playlists WHERE id=?", (pid,)); await db.execute("DELETE FROM playlist_tracks WHERE playlist_id=?", (pid,)); await db.commit()
+        await db.execute("DELETE FROM playlists WHERE id=?", (pid,))
+        await db.execute("DELETE FROM playlist_tracks WHERE playlist_id=?", (pid,))
+        await db.commit()
     await c.answer("🗑 Удален", show_alert=True)
     try: await c.message.delete()
     except: pass
@@ -206,9 +245,11 @@ async def dpl(c):
 async def opl(c):
     pid = int(c.data.split("_")[1])
     async with get_db() as db:
-        cur = await db.execute("SELECT name FROM playlists WHERE id=? AND user_id=?", (pid, c.from_user.id)); pl = await cur.fetchone()
+        cur = await db.execute("SELECT name FROM playlists WHERE id=? AND user_id=?", (pid, c.from_user.id))
+        pl = await cur.fetchone()
         if not pl: await c.answer("❌", show_alert=True); return
-        cur = await db.execute("SELECT tracks.id, tracks.file_id FROM tracks JOIN playlist_tracks ON tracks.id=playlist_tracks.track_id WHERE playlist_tracks.playlist_id=?", (pid,)); tr = await cur.fetchall()
+        cur = await db.execute("SELECT tracks.id, tracks.file_id FROM tracks JOIN playlist_tracks ON tracks.id=playlist_tracks.track_id WHERE playlist_tracks.playlist_id=?", (pid,))
+        tr = await cur.fetchall()
         if not tr: await c.message.answer(f"📋 «{pl[0]}» пуст."); await c.answer(); return
         await c.message.answer(f"📋 «{pl[0]}»:")
         for t in tr:
@@ -222,28 +263,34 @@ async def opl(c):
 async def cpl(c):
     tid = int(c.data.split("_")[1])
     async with get_db() as db:
-        cur = await db.execute("SELECT id, name FROM playlists WHERE user_id=?", (c.from_user.id,)); pls = await cur.fetchall()
+        cur = await db.execute("SELECT id, name FROM playlists WHERE user_id=?", (c.from_user.id,))
+        pls = await cur.fetchall()
     if not pls: await c.answer("Создай плейлист", show_alert=True); return
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"📋 {p[1]}", callback_data=f"apl_{p[0]}_{tid}")] for p in pls])
-    await c.message.answer("Выбери:", reply_markup=kb); await c.answer()
+    await c.message.answer("Выбери:", reply_markup=kb)
+    await c.answer()
 
 @dp.callback_query(F.data.startswith("apl_"))
 async def apl(c):
-    p = c.data.split("_"); pid, tid = int(p[1]), int(p[турецкая строка[2])
+    p = c.data.split("_")
+    pid, tid = int(p[1]), int(p[2]) # Исправлена "турецкая строка"
     async with get_db() as db:
-        await db.execute("INSERT OR IGNORE INTO playlist_tracks (playlist_id, track_id) VALUES (?,?)", (pid, tid)); await db.commit()
-    await c.answer("✅", show_alert=True)
+        await db.execute("INSERT OR IGNORE INTO playlist_tracks (playlist_id, track_id) VALUES (?,?)", (pid, tid))
+        await db.commit()
+    await c.answer("✅ Добавлено", show_alert=True)
     try: await c.message.delete()
-    except: await c.message.delete()
+    except: pass
 
 @dp.callback_query(F.data.startswith("rmpl_"))
 async def rmpl(c):
-    p = c.data.split("_"); pid, tid = int(p[1]), int(p[турецкая строка[2])
+    p = c.data.split("_")
+    pid, tid = int(p[1]), int(p[2]) # Исправлена "турецкая строка"
     async with get_db() as db:
-        await db.execute("DELETE FROM playlist_tracks WHERE playlist_id=? AND track_id=?", (pid, tid)); await db.commit()
-    await c.answer("🗑", show_alert=True)
+        await db.execute("DELETE FROM playlist_tracks WHERE playlist_id=? AND track_id=?", (pid, tid))
+        await db.commit()
+    await c.answer("🗑 Убрано", show_alert=True)
     try: await c.message.delete()
-    except: await c.message.delete()
+    except: pass
 
 @dp.message(Command("stats"))
 async def stats(m):
@@ -251,9 +298,9 @@ async def stats(m):
     async with get_db() as db:
         cur = await db.execute("SELECT COUNT(*) FROM tracks"); tt = (await cur.fetchone())[0]
         cur = await db.execute("SELECT COALESCE(SUM(plays),0) FROM tracks"); tp = (await cur.fetchone())[0]
-        cur = await db.execute("SELECT COUNT(DISTINCT user_id) FROM favorites"); tu = await cur.fetchone()[0]
-        cur = await db.execute("SELECT COUNT(*) FROM playlists"); tpl = await cur.fetchone()[0]
-    await m.answer(f"📊 <b>Статистика:</b>\n🎵 Треков: {tt}\n🎧 Прослушиваний: {tp}\n👥 С избранных юзеров: {tu}\n📋 Плейлистов: {tpl}", parse_mode="HTML")
+        cur = await db.execute("SELECT COUNT(DISTINCT user_id) FROM favorites"); tu = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM playlists"); tpl = (await cur.fetchone())[0]
+    await m.answer(f"📊 <b>Статистика:</b>\n🎵 Треков: {tt}\n🎧 Прослушиваний: {tp}\n👥 С избранных юзеров: {tu}\n📋 Плейлистов: {tpl}")
 
 @dp.message(Command("manage"))
 async def mg(m):
@@ -261,9 +308,12 @@ async def mg(m):
     a = m.text.split(maxsplit=1)
     async with get_db() as db:
         if len(a)>=2:
-            q = a[1].strip().lower(); cur = await db.execute("SELECT id, title, artist FROM tracks WHERE title LIKE ? OR artist LIKE ? ORDER BY id DESC", (f"%{q}%", f"%{q}%")); h = f"🔍 По «{a[1].strip()}»:"
+            q = a[1].strip().lower()
+            cur = await db.execute("SELECT id, title, artist FROM tracks WHERE title LIKE ? OR artist LIKE ? ORDER BY id DESC", (f"%{q}%", f"%{q}%"))
+            h = f"🔍 По «{a[1].strip()}»:"
         else:
-            cur = await db.execute("SELECT id, title, artist FROM tracks ORDER BY.id DESC LIMIT 30"); h = "🗑 Последние 30:"
+            cur = await db.execute("SELECT id, title, artist FROM tracks ORDER BY id DESC LIMIT 30")
+            h = "🗑 Последние 30:"
         res = await cur.fetchall()
     if not res: await m.answer("📂 Пусто."); return
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"🗑 {format_track(t[2], t[1])}", callback_data=f"del_{t[0]}")] for t in res])
@@ -277,73 +327,83 @@ async def sm(m, state: FSMContext):
     res = await run_search(q)
     if not res:
         async with get_db() as db:
-            cur = await db.execute("SELECT COUNT(*) FROM tracks"); tot = cur.fetchone()[0]
-        await m.answer("❌ База пуста." if tot==0 else f"❌ Ничего по «<b>{q}</b>»", parse_mode="HTML"); return
+            cur = await db.execute("SELECT COUNT(*) FROM tracks"); tot = (await cur.fetchone())[0]
+        await m.answer("❌ База пуста." if tot==0 else f"❌ Ничего по «<b>{q}</b>»")
+        return
     lines = [f"{i}. {format_track(t[2], t[1])}" for i, t in enumerate(res, 1)]
-    await m.answer(f"🎧 <b>Найдено {len(res)}:</b>\n\n" + "\n".join(lines) + "\n\n👇 Нажми номер:", parse_mode="HTML", reply_markup=num_buttons([t[0] for t in res]))
+    await m.answer(f"🎧 <b>Найдено {len(res)}:</b>\n\n" + "\n".join(lines) + "\n\n👇 Нажми номер:", reply_markup=num_buttons([t[0] for t in res]))
 
 @dp.callback_query(F.data.startswith("track_"))
 async def st(c):
     tid = int(c.data.split("_")[1])
     async with get_db() as db:
-        cur = await db.execute("SELECT file_id FROM tracks WHERE id=?", (tid,)); r = await cur.fetchone()
+        cur = await db.execute("SELECT file_id FROM tracks WHERE id=?", (tid,))
+        r = await cur.fetchone()
         if not r: await c.answer("❌", show_alert=True); return
-        await db.execute("UPDATE tracks SET plays=plays+1 WHERE id=?", (tid,)); await db.commit()
-    await c.message.answer_audio(r[0], reply_markup=await track_keyboard(tid, c.from_user.id)); await c.answer()
+        await db.execute("UPDATE tracks SET plays=plays+1 WHERE id=?", (tid,))
+        await db.commit()
+    await c.message.answer_audio(r[0], reply_markup=await track_keyboard(tid, c.from_user.id))
+    await c.answer()
 
 @dp.callback_query(F.data.startswith("fav_"))
 async def af(c):
     tid = int(c.data.split("_")[1])
     async with get_db() as db:
-        await db.execute("INSERT OR IGNORE INTO favorites (user_id, track_id) VALUES (?,?)", (c.from_user.id, tid)); await db.commit()
+        await db.execute("INSERT OR IGNORE INTO favorites (user_id, track_id) VALUES (?,?)", (c.from_user.id, tid))
+        await db.commit()
     await c.answer("❤️")
 
 @dp.callback_query(F.data.startswith("unfav_"))
 async def uf(c):
     tid = int(c.data.split("_")[1])
     async with get_db() as db:
-        await db.execute("DELETE FROM favorites WHERE user_id=? AND track_id=?", (c.from_user.id, tid)); await db.commit()
+        await db.execute("DELETE FROM favorites WHERE user_id=? AND track_id=?", (c.from_user.id, tid))
+        await db.commit()
     await c.answer("💔")
     try: await c.message.delete()
-    except Exception: await c.message.delete()
-
-@dp.callback_query(F.data.startswith("турецкая строка[2]"))
-async def rmpl(c):
-
-    async with get_db() as у вас была опечатка: в `rmpl` индексы массива выходят за пределы. Я исправил это для вас.
-    pid, tid = int(p[1]), int(p[2])
-    async with get_db() as db:
-        await db.execute("DELETE FROM playlist_tracks WHERE playlist_id=? AND track_id=?", (pid, tid)); await db.commit()
-    await c.answer("🗑", show_alert=True)
-    try: await c.message.delete()
-    except Exception: await c.message.delete()
+    except: pass
 
 @dp.callback_query(F.data.startswith("del_"))
 async def dt(c):
     if c.from_user.id != ADMIN_ID: await c.answer("⛔", show_alert=True); return
     tid = int(c.data.split("_")[1])
     async with get_db() as db:
-        cur = await db.execute("SELECT title, artist FROM tracks WHERE id=?", (tid,)); t = await cur.fetchone()
+        cur = await db.execute("SELECT title, artist FROM tracks WHERE id=?", (tid,))
+        t = await cur.fetchone()
         if not t: await c.answer("❌", show_alert=True); return
         await db.execute("DELETE FROM tracks WHERE id=?", (tid,))
         await db.execute("DELETE FROM favorites WHERE track_id=?", (tid,))
         await db.execute("DELETE FROM playlist_tracks WHERE track_id=?", (tid,))
         await db.commit()
-    await c.answer(f"✅ Удалено", show_alert=True)
+    await c.answer("✅ Удалено", show_alert=True)
     try: await c.message.delete()
-    except Exception: await c.message.delete()
+    except: pass
 
-# --- ЗАПУСК ДЛЯ KOYEB (Без aiohttp, без bot.me, без таймаутов - ИДЕАЛЬНО ДЛЯ СВОБОДНОГО КОДА ---
+# --- ЗАПУСК ДЛЯ KOYEB ---
+# Koyeb требует слушания порта 8000. Этот сервер просто держит контейнер активным.
+async def webhook_handler(request):
+    return web.Response(text="Бот работает через Polling")
+
 async def main():
     await init_db()
-    print("✅ Бот запущен через Polling. База данных в безопасности. Сеть не нужна!")
     
+    # Запускаем фейковый веб-сервер для Koyeb на порту 8000
+    app = web.Application()
+    app.router.add_get("/", webhook_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8000))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    logging.info(f"✅ Веб-сервер запущен на порту {port} (для Koyeb)")
+    
+    # Запускаем бота
+    logging.info("✅ Бот запущен через Polling")
     try:
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
+        await runner.cleanup()
 
-if __name__ "__main__":
-    asyncio.run(main())
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
