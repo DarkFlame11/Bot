@@ -4,24 +4,20 @@ import asyncio
 import logging
 import aiosqlite
 from contextlib import asynccontextmanager
-from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.client.session.aiohttp import ClientTimeout
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiogram.client.default import DefaultBotProperties
 
 logging.basicConfig(level=logging.INFO)
-
-# Koyeb автоматически подставит эти значения
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
+dp = Dispatcher(storage=memory_storage())
 DB_PATH = "database.db"
 
 @asynccontextmanager
@@ -250,29 +246,9 @@ async def stats(m):
     async with get_db() as db:
         cur = await db.execute("SELECT COUNT(*) FROM tracks"); tt = (await cur.fetchone())[0]
         cur = await db.execute("SELECT COALESCE(SUM(plays),0) FROM tracks"); tp = (await cur.fetchone())[0]
-        cur = await db.execute("SELECT COUNT(DISTINCT user_id) FROM favorites"); tu = await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(DISTINCT user_id) FROM favorites"); tu = (await cur.fetchone())[0]
         cur = await db.execute("SELECT COUNT(*) FROM playlists"); tpl = (await cur.fetchone())[0]
     await m.answer(f"📊 <b>Стат:</b>\n🎵 Треков: {tt}\n🎧 Прослушиваний: {tp}\n👥 Избранных юзеров: {tu}\n📋 Плейлистов: {tpl}", parse_mode="HTML")
-
-# --- ЗАПУСК БЕЗ ОШИБОК СЕТЬИ ---
-async def main():
-    await init_db()
-    
-    # Увеличиваем таймаут сети до 120 секунд, чтобы Koyeb не убивал бота
-    from aiogram.client.default import DefaultBotProperties
-    DefaultBotProperties.parse_mode = ParseMode.HTML
-    bot.default = DefaultBotProperties(parse_mode=ParseMode.HTML)
-    bot.session.aiohttp_connector._timeout = 120
-    
-    print("✅ Бот запущен. Таймаут сети: 120с.")
-    
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await bot.session.close()
-
-if __name__ == "__main__":
-    asyncio.run(main())
 
 @dp.message(Command("manage"))
 async def mg(m):
@@ -320,7 +296,7 @@ async def af(c):
 @dp.callback_query(F.data.startswith("unfav_"))
 async def uf(c):
     tid = int(c.data.split("_")[1])
-    async with get_db() as db:
+    async with get_db() as.db():
         await db.execute("DELETE FROM favorites WHERE user_id=? AND track_id=?", (c.from_user.id, tid)); await db.commit()
     await c.answer("💔")
     try: await c.message.delete()
@@ -342,39 +318,22 @@ async def dt(c):
     except: pass
 
 
-# --- WEB-СЕРВЕР ДЛЯ KOYEB ---
-# --- WEB-СЕРВЕР ДЛЯ KOYEB ---
-WEBHOOK_PATH = "/webhook"
-app = web.Application()
-app.router.add_get("/", lambda r: web.Response(text="OK"))
-
-async def on_startup(app):
+# --- ЗАПУСК ДЛЯ KOYEB ---
+async def main():
     await init_db()
     
-    # Увеличиваем таймаут сети до 60 секунд, чтобы Koyeb не убивал контейнер
-    bot.session.aiohttp_connector._timeout = ClientTimeout(total=60)
+    # Настраиваем таймаут сети на 2 минуты, чтобы Koyeb не убивал бота
+    from aiogram.client.default import DefaultBotProperties
+    DefaultBotProperties.parse_mode = ParseMode.HTML
+    bot.default = DefaultBotOperations.default(bot)
+    bot.session.aiohttp_connector._timeout = 120
     
-    app_url = os.environ.get("KOYEB_APP_URL")
+    print("✅ Бот запущен через Polling. База данных в безопасности.")
     
-    if app_url:
-        webhook_url = f"{app_url}{WEBHOOK_PATH}"
-        print(f"Устанавливаю вебхук: {webhook_url}")
-        
-        try:
-            # Убрали drop_pending_updates! Это снижает сетевую нагрузку
-            await bot.set_webhook(webhook_url)
-            print("✅ Вебхук установлен!")
-        except Exception as e:
-            # Если Koyeb блокирует сеть, бот НЕ УПАДЕТ, а включит Polling
-            print(f"⚠️ Сетевая ошибка вебхука: {e}")
-            print("Переключаюсь на Polling...")
-            asyncio.create_task(dp.start_polling(bot))
-    else:
-        print("KOYEB_APP_URL не найден, запускаю Polling...")
-        asyncio.create_task(dp.start_polling(bot))
-
-SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
-setup_application(app, dp, bot=bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
 
 if __name__ == "__main__":
-    web.run_app(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    asyncio.run(main())
