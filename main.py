@@ -322,21 +322,29 @@ async def dt(c):
 
 
 # --- WEB-СЕРВЕР ДЛЯ KOYEB ---
+# --- WEB-СЕРВЕР ДЛЯ KOYEB ---
 WEBHOOK_PATH = "/webhook"
 app = web.Application()
 app.router.add_get("/", lambda r: web.Response(text="OK"))
 
 async def on_startup(app):
     await init_db()
-    # Koyeb автоматически дает эти переменные
     port = int(os.environ.get("PORT", 8080))
     app_url = os.environ.get("KOYEB_APP_URL")
+    
     if app_url:
         webhook_url = f"{app_url}{WEBHOOK_PATH}"
-        print(f"Setting webhook: {webhook_url}")
-        await bot.set_webhook(webhook_url, drop_pending_updates=True)
+        print(f"Устанавливаю вебхук: {webhook_url}")
+        
+        try:
+            await bot.set_webhook(webhook_url, drop_pending_updates=True)
+            print("✅ Вебхук успешно установлен!")
+        except Exception as e:
+            print(f"❌ ОШИБКА ВЕБХУКА: {e}")
+            print("⚠️ Переключаюсь на Polling...")
+            asyncio.create_task(dp.start_polling(bot))
     else:
-        print("KOYEB_APP_URL not found, starting polling...")
+        print("KOYEB_APP_URL не найден, запускаю Polling...")
         asyncio.create_task(dp.start_polling(bot))
 
 SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
