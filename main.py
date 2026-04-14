@@ -10,6 +10,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.client.session.aiohttp import ClientTimeout
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
@@ -329,7 +330,10 @@ app.router.add_get("/", lambda r: web.Response(text="OK"))
 
 async def on_startup(app):
     await init_db()
-    port = int(os.environ.get("PORT", 8080))
+    
+    # Увеличиваем таймаут сети до 60 секунд, чтобы Koyeb не убивал контейнер
+    bot.session.aiohttp_connector._timeout = ClientTimeout(total=60)
+    
     app_url = os.environ.get("KOYEB_APP_URL")
     
     if app_url:
@@ -337,11 +341,13 @@ async def on_startup(app):
         print(f"Устанавливаю вебхук: {webhook_url}")
         
         try:
-            await bot.set_webhook(webhook_url, drop_pending_updates=True)
-            print("✅ Вебхук успешно установлен!")
+            # Убрали drop_pending_updates! Это снижает сетевую нагрузку
+            await bot.set_webhook(webhook_url)
+            print("✅ Вебхук установлен!")
         except Exception as e:
-            print(f"❌ ОШИБКА ВЕБХУКА: {e}")
-            print("⚠️ Переключаюсь на Polling...")
+            # Если Koyeb блокирует сеть, бот НЕ УПАДЕТ, а включит Polling
+            print(f"⚠️ Сетевая ошибка вебхука: {e}")
+            print("Переключаюсь на Polling...")
             asyncio.create_task(dp.start_polling(bot))
     else:
         print("KOYEB_APP_URL не найден, запускаю Polling...")
