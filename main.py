@@ -4,15 +4,19 @@ import asyncio
 import logging
 import aiosqlite
 from contextlib import asynccontextmanager
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 logging.basicConfig(level=logging.INFO)
-BOT_TOKEN = "8598620829:AAEMH59TB8z1BotbsSuyRBqknTHlRMp8rRI"
+
+# Koyeb автоматически подставит эти значения
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
 bot = Bot(token=BOT_TOKEN)
@@ -25,7 +29,7 @@ async def get_db():
     try:
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA busy_timeout=5000")
-        await db.execute("PRAGMA case_sensitive_like = OFF") # Магия поиска
+        await db.execute("PRAGMA case_sensitive_like = OFF")
         yield db
     finally:
         await db.close()
@@ -246,7 +250,7 @@ async def stats(m):
         cur = await db.execute("SELECT COUNT(*) FROM tracks"); tt = (await cur.fetchone())[0]
         cur = await db.execute("SELECT COALESCE(SUM(plays),0) FROM tracks"); tp = (await cur.fetchone())[0]
         cur = await db.execute("SELECT COUNT(DISTINCT user_id) FROM favorites"); tu = (await cur.fetchone())[0]
-        cur = await db.execute("SELECT COUNT(*) FROM playlists"); tpl = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM playlists"); tpl = await cur.fetchone())[0]
     await m.answer(f"📊 <b>Стат:</b>\n🎵 Треков: {tt}\n🎧 Прослушиваний: {tp}\n👥 Избранных юзеров: {tu}\n📋 Плейлистов: {tpl}", parse_mode="HTML")
 
 @dp.message(Command("manage"))
@@ -316,11 +320,27 @@ async def dt(c):
     try: await c.message.delete()
     except: pass
 
-# --- ЗАПУСК ЧЕРЕЗ ПОЛЛИНГ (ДЛЯ СТАБИЛЬНОСТИ) ---
-async def main():
+
+# --- WEB-СЕРВЕР ДЛЯ KOYEB ---
+WEBHOOK_PATH = "/webhook"
+app = web.Application()
+app.router.add_get("/", lambda r: web.Response(text="OK"))
+
+async def on_startup(app):
     await init_db()
-    logging.info("Бот запущен через Polling. База данных в безопасности.")
-    await dp.start_polling(bot)
+    # Koyeb автоматически дает эти переменные
+    port = int(os.environ.get("PORT", 8080))
+    app_url = os.environ.get("KOYEB_APP_URL")
+    if app_url:
+        webhook_url = f"{app_url}{WEBHOOK_PATH}"
+        print(f"Setting webhook: {webhook_url}")
+        await bot.set_webhook(webhook_url, drop_pending_updates=True)
+    else:
+        print("KOYEB_APP_URL not found, starting polling...")
+        asyncio.create_task(dp.start_polling(bot))
+
+SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
+setup_application(app, dp, bot=bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    web.run_app(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
