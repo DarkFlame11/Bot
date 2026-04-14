@@ -250,9 +250,29 @@ async def stats(m):
     async with get_db() as db:
         cur = await db.execute("SELECT COUNT(*) FROM tracks"); tt = (await cur.fetchone())[0]
         cur = await db.execute("SELECT COALESCE(SUM(plays),0) FROM tracks"); tp = (await cur.fetchone())[0]
-        cur = await db.execute("SELECT COUNT(DISTINCT user_id) FROM favorites"); tu = (await cur.fetchone())[0]
-        cur = await db.execute("SELECT COUNT(*) FROM playlists"); tpl = await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(DISTINCT user_id) FROM favorites"); tu = await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM playlists"); tpl = (await cur.fetchone())[0]
     await m.answer(f"📊 <b>Стат:</b>\n🎵 Треков: {tt}\n🎧 Прослушиваний: {tp}\n👥 Избранных юзеров: {tu}\n📋 Плейлистов: {tpl}", parse_mode="HTML")
+
+# --- ЗАПУСК БЕЗ ОШИБОК СЕТЬИ ---
+async def main():
+    await init_db()
+    
+    # Увеличиваем таймаут сети до 120 секунд, чтобы Koyeb не убивал бота
+    from aiogram.client.default import DefaultBotProperties
+    DefaultBotProperties.parse_mode = ParseMode.HTML
+    bot.default = DefaultBotProperties(parse_mode=ParseMode.HTML)
+    bot.session.aiohttp_connector._timeout = 120
+    
+    print("✅ Бот запущен. Таймаут сети: 120с.")
+    
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
 @dp.message(Command("manage"))
 async def mg(m):
