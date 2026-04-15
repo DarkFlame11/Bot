@@ -1,4 +1,5 @@
 import os
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 import sys
 import asyncio
 import logging
@@ -537,9 +538,7 @@ async def main():
     
 
     WEBHOOK_PATH = "/webhook"
-    WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-
-
+ 
 async def main():
     await init_db_pool()
     await asyncio.sleep(2)
