@@ -396,6 +396,7 @@ async def dt(c: types.CallbackQuery):
     except: pass
 
 # --- ЗАПУСК ДЛЯ KOYEB (Веб-сервер + Поллинг) ---
+# --- ЗАПУСК ДЛЯ KOYEB (Веб-сервер + Поллинг) ---
 async def health_check(request):
     return web.Response(text="Bot is alive")
 
@@ -413,11 +414,19 @@ async def main():
     logging.info(f"✅ Пинг для Koyeb слушает порт {port}")
     
     logging.info("✅ Запуск бота...")
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await bot.session.close()
-        await runner.cleanup()
+    while True:  # ← ДОБАВЛЕНО: цикл перезапуска
+        try:
+            await dp.start_polling(bot)
+        except Exception as e:
+            if "Conflict" in str(e):
+                logging.error(f"❌ {e}")
+                await asyncio.sleep(5)
+                logging.info("🔄 Переподключение...")
+                continue
+            raise
+        finally:
+            await bot.session.close()
+            await runner.cleanup()
 
 if __name__ == "__main__":
     asyncio.run(main())
