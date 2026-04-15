@@ -56,7 +56,7 @@ async def init_db_pool():
         logging.info("✅ DB pool создан")
 
         # прогрев соединения (важно для Koyeb)
-        await asyncio.sleep(1)
+        #await asyncio.sleep(1)
 
         async with db_pool.acquire() as conn:
             await conn.fetchval("SELECT 1")
@@ -538,7 +538,7 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 
 async def main():
     await init_db_pool()
-    await asyncio.sleep(1)
+    #await asyncio.sleep(1)
     await init_db()
 
     app = web.Application()
