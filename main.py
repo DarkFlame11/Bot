@@ -5,6 +5,8 @@ import logging
 import html
 import random # ИСПРАВЛЕНО: Добавлен random
 import asyncpg # ИСПРАВЛЕНО: Добавлен asyncpg вместо aiosqlite
+import socket
+import urllib.parse
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F, types
@@ -41,17 +43,17 @@ db_pool = None
 async def init_db_pool():
     global db_pool
     try:
-        import urllib.parse
         url = urllib.parse.urlparse(DATABASE_URL)
+        ip = socket.gethostbyname(url.hostname)
         
         db_pool = await asyncpg.create_pool(
-            host=url.hostname,
+            host=ip,
             port=url.port or 5432,
             user=url.username,
             password=urllib.parse.unquote(url.password),
             database=url.path.lstrip('/'),
-            min_size=5,
-            max_size=20,
+            min_size=2,
+            max_size=10,
             command_timeout=30,
             ssl='require'
         )
@@ -59,6 +61,7 @@ async def init_db_pool():
     except Exception as e:
         logging.error(f"❌ Ошибка подключения к БД: {e}")
         raise
+
 
 
 async def get_db():
