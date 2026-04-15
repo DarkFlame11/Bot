@@ -43,15 +43,24 @@ db_pool = None
 async def init_db_pool():
     global db_pool
     try:
-        url = urllib.parse.urlparse(DATABASE_URL)
-        ip = socket.gethostbyname(url.hostname)
+        # Убираем скобки из URL если есть
+        clean_url = DATABASE_URL.replace('[', '').replace(']', '')
         
+        import re
+        match = re.match(r'postgresql://([^:]+):([^@]+)@([^:]+):(\d+)/(.+)', clean_url)
+        if not match:
+            raise ValueError(f"Неверный формат DATABASE_URL")
+        
+        user, password, host, port, database = match.groups()
+        ip = socket.gethostbyname(host)
+        logging.info(f"✅ DNS: {host} -> {ip}")
+
         db_pool = await asyncpg.create_pool(
             host=ip,
-            port=url.port or 5432,
-            user=url.username,
-            password=urllib.parse.unquote(url.password),
-            database=url.path.lstrip('/'),
+            port=int(port),
+            user=user,
+            password=urllib.parse.unquote(password),
+            database=database,
             min_size=2,
             max_size=10,
             command_timeout=30,
@@ -61,6 +70,7 @@ async def init_db_pool():
     except Exception as e:
         logging.error(f"❌ Ошибка подключения к БД: {e}")
         raise
+
 
 
 
