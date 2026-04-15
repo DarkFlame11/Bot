@@ -532,28 +532,53 @@ async def health_check(request):
     return web.Response(text="Bot is alive")
 
 async def main():
-    await bot.delete_webhook(drop_pending_updates=True)
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = f"https://YOUR-APP-NAME.koyeb.app{WEBHOOK_PATH}"
+
+
+async def main():
+    from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = f"https://distinguished-rosemaria-danielyans8d-b247c964.koyeb.app/"
+
+
+async def main():
     await init_db_pool()
-    # ❗ задержка перед первым SQL
     await asyncio.sleep(2)
     await init_db()
-    #await bot.delete_webhook(drop_pending_updates=True)
-    #await dp.start_polling(bot)
-    
+
+    # --- AIOHTTP APP ---
     app = web.Application()
     app.router.add_get("/", health_check)
+
     runner = web.AppRunner(app)
     await runner.setup()
-    
-    port = int(os.environ.get("PORT"))
-    site = web.TCPSite(runner, '0.0.0.0', port)
+
+    port = int(os.environ.get("PORT", 8000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logging.info(f"✅ Пинг для Koyeb слушает порт {port}")
-    
-    logging.info("✅ Запуск бота...")
+
+    logging.info(f"Healthcheck on {port}")
+
+    # --- WEBHOOK SETUP ---
+    await bot.delete_webhook(drop_pending_updates=True)
+
+    await bot.set_webhook(
+        WEBHOOK_URL,
+        drop_pending_updates=True
+    )
+
+    # --- aiogram webhook handler ---
+    SimpleRequestHandler(dp, bot).register(app, path=WEBHOOK_PATH)
+    setup_application(app, dp, bot)
+
+    logging.info("🚀 Bot started in WEBHOOK mode")
+
     try:
-        await asyncio.sleep(5)
-        await dp.start_polling(bot)
+        await asyncio.Event().wait()  # держит процесс живым
     finally:
         await bot.session.close()
         if db_pool:
