@@ -4,6 +4,7 @@ import asyncio
 import logging
 import html
 import aiosqlite
+import random
 from contextlib import asynccontextmanager
 from aiohttp import web
 
@@ -13,6 +14,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.client.session.aiohttp import AiohttpSession
 
 # --- НАСТРОЙКИ ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -23,8 +25,9 @@ if not BOT_TOKEN:
 
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
-# Инициализация БЕЗ глобального parse_mode, чтобы избежать bad_request
-bot = Bot(token=BOT_TOKEN)
+# Инициализация с правильным timeout
+session = AiohttpSession(timeout=30)
+bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher(storage=MemoryStorage())
 DB_PATH = "database.db"
 
@@ -76,8 +79,8 @@ async def track_keyboard(tid, uid):
     return InlineKeyboardMarkup(inline_keyboard=[[btn], [InlineKeyboardButton(text="➕ В плейлист", callback_data=f"topl_{tid}")]])
 
 # --- ПОИСК И ТРАНСЛИТЕРАЦИЯ ---
-CYR_LAT = {'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'yo','ж':'zh','з':'z','и':'i','й':'y','к':'k','л':'l','м':'m','н':'n','о':'o','п':'p','р':'р','с':'s','т':'t','у':'u','ф':'f','х':'kh','ц':'ts','ч':'ch','ш':'sh','щ':'shch','ъ':'','ы':'y','ь':'','э':'e','ю':'yu','я':'ya','дж':'j'}
-LAT_CYR = {"shch":"щ","sh":"ш","ch":"ч","zh":"ж","ts":"ц","yu":"ю","ya":"я","kh":"х","yo":"ё","a":"а","b":"б","v":"в","g":"г","d":"д","e":"е","z":"з","i":"и","y":"и","k":"к","l":"л","m":"м","n":"н","o":"о","p":"п","r":"р","s":"с","t":"т","u":"у","f":"ф","w":"в","x":"кс","j":"дж","h":"х"}
+CYR_LAT = {'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'yo','ж':'zh','з':'z','и':'i','й':'y','к':'k','л':'l','м':'m','н':'n','о':'o','п':'p','р':'р','с':'s','т':'t','у':'u','ф':'f','х':'h','ц':'ts','ч':'ch','ш':'sh','щ':'shch','ъ':'','ы':'y','ь':'','э':'e','ю':'yu','я':'ya'}
+LAT_CYR = {"shch":"щ","sh":"ш","ch":"ч","zh":"ж","ts":"ц","yu":"ю","ya":"я","kh":"х","yo":"ё","a":"а","b":"б","v":"в","g":"г","d":"д","e":"е","z":"з","i":"и","y":"и","k":"к","l":"л","m":"м","n":"н","o":"о","p":"п","r":"р","s":"с","t":"т","u":"у","f":"ф","h":"х","c":"к","x":"х"}
 
 def translit(t, m):
     r = t.lower()
@@ -157,9 +160,15 @@ async def imp_track(m: types.Message):
 @dp.message(F.text == "🎲 Случайный")
 async def rnd(m: types.Message):
     async with get_db() as db:
-        cur = await db.execute("SELECT id, file_id FROM tracks ORDER BY RANDOM() LIMIT 1")
+        # ИСПРАВЛЕНО: Вместо ORDER BY RANDOM()
+        cur = await db.execute("SELECT COUNT(*) FROM tracks")
+        count = (await cur.fetchone())[0]
+        if count == 0:
+            await m.answer("❌ База пуста")
+            return
+        offset = random.randint(0, count - 1)
+        cur = await db.execute("SELECT id, file_id FROM tracks LIMIT 1 OFFSET ?", (offset,))
         r = await cur.fetchone()
-        if not r: await m.answer("❌ База пуста"); return
         await db.execute("UPDATE tracks SET plays=plays+1 WHERE id=?", (r[0],))
         await db.commit()
     try:
