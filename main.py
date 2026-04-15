@@ -43,32 +43,12 @@ db_pool = None
 async def init_db_pool():
     global db_pool
     try:
-        import re
-        import ssl
-        
-        clean_url = DATABASE_URL.replace('[', '').replace(']', '')
-        match = re.match(r'postgresql://([^:]+):([^@]+)@([^:]+):(\d+)/(.+)', clean_url)
-        if not match:
-            raise ValueError("Неверный формат DATABASE_URL")
-        
-        user, password, host, port, database = match.groups()
-        ip = socket.gethostbyname(host)
-        logging.info(f"✅ DNS: {host} -> {ip}")
-
-        ssl_ctx = ssl.create_default_context()
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl.CERT_NONE
-
         db_pool = await asyncpg.create_pool(
-            host=ip,
-            port=int(port),
-            user=user,
-            password=urllib.parse.unquote(password),
-            database=database,
+            DATABASE_URL,
             min_size=1,
             max_size=5,
             command_timeout=60,
-            ssl=ssl_ctx
+            ssl="require"
         )
         logging.info("✅ Пул подключений к Supabase создан")
     except Exception as e:
