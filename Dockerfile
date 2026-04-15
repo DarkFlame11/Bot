@@ -10,4 +10,4 @@ RUN apt-get update && apt-get install -y procps
 COPY main.py .
 
 # Убиваем любые старые процессы перед запуском
-CMD pkill -9 -f main.py || true; python3 main.py
+CMD pkill -9 -f main.py || true; python main.py
