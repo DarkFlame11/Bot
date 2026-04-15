@@ -2,12 +2,15 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Устанавливаем зависимости
+# Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем код бота
+# Copy bot code
 COPY main.py .
 
-# Запускаем
-CMD ["python3 main.py"]
+# Debug: list files to verify they exist
+RUN ls -la /app/
+
+# Run the bot
+CMD ["python3", "main.py"]
