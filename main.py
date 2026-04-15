@@ -532,19 +532,43 @@ async def dt(c: types.CallbackQuery):
 async def health_check(request):
     return web.Response(text="Bot is alive")
 
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-async def main():
-    await bot.delete_webhook(drop_pending_updates=True)
- 
+
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler
+
+
 async def main():
     await init_db_pool()
-    await asyncio.sleep(2)
+    await asyncio.sleep(1)
     await init_db()
 
     # --- AIOHTTP APP ---
     app = web.Application()
     app.router.add_get("/", health_check)
 
+    # --- WEBHOOK PATH ---
+    WEBHOOK_PATH = "/webhook"
+
+    # важно: WEBHOOK_URL должен быть в ENV
+    webhook_url = os.environ.get("WEBHOOK_URL")
+    if not webhook_url:
+        raise ValueError("WEBHOOK_URL is not set")
+
+    # --- DELETE OLD WEBHOOK ---
+    await bot.delete_webhook(drop_pending_updates=True)
+
+    # --- SET NEW WEBHOOK ---
+    await bot.set_webhook(
+        url=webhook_url + WEBHOOK_PATH,
+        drop_pending_updates=True
+    )
+
+    # --- REGISTER HANDLER ---
+    SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+    ).register(app, path=WEBHOOK_PATH)
+
+    # --- START SERVER ---
     runner = web.AppRunner(app)
     await runner.setup()
 
@@ -552,32 +576,7 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-    logging.info(f"Healthcheck on {port}")
+    logging.info(f"🚀 Bot started on port {port}")
 
-    # --- WEBHOOK SETUP ---
-    await bot.delete_webhook(drop_pending_updates=True)
-
-    await bot.set_webhook(
-        WEBHOOK_URL,
-        drop_pending_updates=True
-    )
-
-    # --- aiogram webhook handler ---
-       SimpleRequestHandler(
-        dispatcher=dp,
-        bot=bot,
-    ).register(app, path="/webhook")
-    setup_application(app, dp, bot)
-
-    logging.info("🚀 Bot started in WEBHOOK mode")
-
-    try:
-        await asyncio.Event().wait()  # держит процесс живым
-    finally:
-        await bot.session.close()
-        if db_pool:
-            await db_pool.close()
-        await runner.cleanup()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    # держим процесс живым
+    await asyncio.Event().wait()
