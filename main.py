@@ -533,6 +533,8 @@ async def health_check(request):
 
 async def main():
     await init_db_pool()
+    # ❗ задержка перед первым SQL
+    await asyncio.sleep(2)
     await init_db()
     
     app = web.Application()
