@@ -10,4 +10,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 
 # Запускаем
-CMD ["python main.py"]
+CMD ["python3 main.py"]
