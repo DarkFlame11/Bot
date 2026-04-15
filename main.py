@@ -537,7 +537,7 @@ async def main():
     
 
     WEBHOOK_PATH = "/webhook"
-    WEBHOOK_URL = f"https://distinguished-rosemaria-danielyans8d-b247c964.koyeb.app/"
+    WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 
 async def main():
