@@ -563,7 +563,10 @@ async def main():
     )
 
     # --- aiogram webhook handler ---
-   SimpleRequestHandler(dispatcher=dp,bot=bot,).register(app, path="/webhook")
+       SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+    ).register(app, path="/webhook")
     setup_application(app, dp, bot)
 
     logging.info("🚀 Bot started in WEBHOOK mode")
