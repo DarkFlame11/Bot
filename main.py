@@ -32,7 +32,7 @@ if not DATABASE_URL:
     raise ValueError("CRITICAL: Переменная DATABASE_URL не задана!")
 
 # Инициализация с правильным timeout
-session = AiohttpSession(timeout=30)
+session = AiohttpSession(timeout=120)
 bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -73,6 +73,7 @@ async def init_db():
     """Создание таблиц в Supabase"""
     pool = await get_db()
     async with pool.acquire() as conn:
+    await conn.fetchval("SELECT 1")
         try:
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS tracks (
