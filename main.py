@@ -3,8 +3,8 @@ import sys
 import asyncio
 import logging
 import html
-import asyncpg
-import random
+import aiosqlite
+from contextlib import asynccontextmanager
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F, types
@@ -13,7 +13,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.default import DefaultBotProperties
 
 # --- НАСТРОЙКИ ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
