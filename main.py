@@ -574,3 +574,6 @@ async def main():
     # 🔥 ВАЖНО: держим процесс живым правильно
     while True:
         await asyncio.sleep(3600)
+        
+   if __name__ == "__main__":
+    asyncio.run(main())
