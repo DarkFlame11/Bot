@@ -41,16 +41,25 @@ db_pool = None
 async def init_db_pool():
     global db_pool
     try:
+        import urllib.parse
+        url = urllib.parse.urlparse(DATABASE_URL)
+        
         db_pool = await asyncpg.create_pool(
-            DATABASE_URL,
+            host=url.hostname,
+            port=url.port or 5432,
+            user=url.username,
+            password=urllib.parse.unquote(url.password),
+            database=url.path.lstrip('/'),
             min_size=5,
             max_size=20,
-            command_timeout=30
+            command_timeout=30,
+            ssl='require'
         )
         logging.info("✅ Пул подключений к Supabase создан")
     except Exception as e:
         logging.error(f"❌ Ошибка подключения к БД: {e}")
         raise
+
 
 async def get_db():
     return db_pool
