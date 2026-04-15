@@ -532,11 +532,12 @@ async def health_check(request):
     return web.Response(text="Bot is alive")
 
 async def main():
+    await bot.delete_webhook(drop_pending_updates=True)
     await init_db_pool()
     # ❗ задержка перед первым SQL
     await asyncio.sleep(2)
     await init_db()
-    await bot.delete_webhook(drop_pending_updates=True)
+    #await bot.delete_webhook(drop_pending_updates=True)
     #await dp.start_polling(bot)
     
     app = web.Application()
@@ -551,6 +552,7 @@ async def main():
     
     logging.info("✅ Запуск бота...")
     try:
+        await asyncio.sleep(5)
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
