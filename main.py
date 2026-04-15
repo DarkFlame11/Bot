@@ -149,55 +149,69 @@ async def track_keyboard(tid, uid):
 CYR_LAT = {
     'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'yo','ж':'zh','з':'z','и':'i',
     'й':'y','к':'k','л':'l','м':'m','н':'n','о':'o','п':'p','р':'r','с':'s','т':'t',
-    'у':'u','ф':'f','х':'h','ц':'ts','ч':'ch','ш':'sh','щ':'shch','ъ':'','ы':'y','ь':'',
+    'у':'u','ф':'f','х':'kh','ц':'ts','ч':'ch','ш':'sh','щ':'shch','ъ':'','ы':'y','ь':'',
     'э':'e','ю':'yu','я':'ya'
 }
 
 LAT_CYR = {
-    "shch":"щ","sh":"ш","ch":"ч","zh":"ж","ts":"ц","yu":"ю","ya":"я","kh":"х",
+    "shch":"щ","sch":"щ","sh":"ш","ch":"ч","zh":"ж","ts":"ц","yu":"ю","ya":"я","kh":"х",
     "yo":"ё","a":"а","b":"б","v":"в","g":"г","d":"д","e":"е","z":"з","i":"и",
     "y":"и","k":"к","l":"л","m":"м","n":"н","o":"о","p":"п","r":"р","s":"с",
-    "t":"т","u":"у","f":"ф","h":"х","c":"к","x":"х"
+    "t":"т","u":"у","f":"ф","h":"х","c":"к","w":"в","x":"х","j":"й"
 }
 
 def translit_to_latin(text):
     """Переводит кириллицу в латиницу"""
     result = text.lower()
-    for cyr, lat in sorted(CYR_LAT.items(), key=lambda x: -len(x[0])):
+    # Сортируем по длине (длинные сначала)
+    for cyr in sorted(CYR_LAT.keys(), key=len, reverse=True):
+        lat = CYR_LAT[cyr]
         result = result.replace(cyr, lat)
     return result
 
 def translit_to_cyrillic(text):
     """Переводит латиницу в кириллицу"""
     result = text.lower()
-    for lat, cyr in sorted(LAT_CYR.items(), key=lambda x: -len(x[0])):
+    # Сортируем по длине (длинные сначала)
+    for lat in sorted(LAT_CYR.keys(), key=len, reverse=True):
+        cyr = LAT_CYR[lat]
         result = result.replace(lat, cyr)
     return result
 
 def get_var(q):
     """Генерирует все возможные варианты поиска"""
-    q = "".join(str(q).lower().split())  # Удаляем пробелы
+    q = q.lower().strip()
     if not q: 
         return []
     
-    # Очищаем от нулевых символов
-    q = q.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '')
+    # Очищаем от нулевых символов и пробелов
+    q = q.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '').replace(' ', '')
     
-    v = {q}  # Исходный запрос
+    if not q:
+        return []
+    
+    v = [q]  # Исходный запрос
+    
+    # Проверяем наличие кириллицы и латиницы
+    has_cyrillic = any(ord(c) >= 0x0400 and ord(c) <= 0x04FF for c in q)
+    has_latin = any(c.isascii() and c.isalpha() for c in q)
     
     # Если кириллица - добавляем латинский вариант
-    if any(c in CYR_LAT for c in q):
+    if has_cyrillic:
         lat = translit_to_latin(q)
         if lat and lat != q:
-            v.add(lat)
+            v.append(lat)
+            logging.info(f"Транслит: '{q}' (кир) → '{lat}' (лат)")
     
     # Если латиница - добавляем кириллический вариант
-    if any(c in LAT_CYR for c in q):
+    if has_latin:
         cyr = translit_to_cyrillic(q)
         if cyr and cyr != q:
-            v.add(cyr)
+            v.append(cyr)
+            logging.info(f"Транслит: '{q}' (лат) → '{cyr}' (кир)")
     
-    return list(v)
+    logging.info(f"Все варианты поиска: {v}")
+    return v
 
 async def run_search(query, limit=10):
     """Поиск треков с поддержкой транслитерации"""
@@ -207,60 +221,39 @@ async def run_search(query, limit=10):
         if not var: 
             return []
         
+        logging.info(f"🔍 Ищем: {var}")
+        
         # Первый поиск - точное совпадение по вариантам
         try:
-            conditions = []
-            params = []
-            param_num = 1
+            # Создаём условия для каждого варианта
+            all_conditions = []
+            all_params = []
+            param_count = 1
             
             for v in var:
-                conditions.append(f"(title ILIKE ${param_num} OR artist ILIKE ${param_num})")
-                params.append(f"%{v}%")
-                param_num += 1
+                # Для каждого варианта ищем и в title, и в artist
+                all_conditions.append(f"title ILIKE ${param_count}")
+                all_params.append(f"%{v}%")
+                param_count += 1
+                
+                all_conditions.append(f"artist ILIKE ${param_count}")
+                all_params.append(f"%{v}%")
+                param_count += 1
             
-            sql = f"SELECT id, title, artist FROM tracks WHERE {' OR '.join(conditions)} LIMIT ${param_num}"
-            params.append(limit)
+            # Объединяем все условия через OR
+            sql = f"SELECT DISTINCT id, title, artist FROM tracks WHERE {' OR '.join(all_conditions)} LIMIT ${param_count}"
+            all_params.append(limit)
             
-            res = await conn.fetch(sql, *params)
+            logging.info(f"SQL запрос: {sql}")
+            logging.info(f"Параметры: {all_params}")
+            
+            res = await conn.fetch(sql, *all_params)
+            logging.info(f"✅ Найдено {len(res)} треков")
+            
             if res: 
                 return res
         except Exception as e: 
-            logging.error(f"Err1 (точный поиск): {e}")
-        
-        # Второй поиск - по отдельным словам
-        words = set()
-        for v in var:
-            for w in v.split():
-                if len(w) >= 2: 
-                    words.add(w)
-        
-        if not words: 
-            return []
-        
-        try:
-            conditions = []
-            params = []
-            param_num = 1
-            
-            for w in words:
-                conditions.append(f"(title ILIKE ${param_num} OR artist ILIKE ${param_num})")
-                params.append(f"%{w}%")
-                param_num += 1
-            
-            sql = f"SELECT id, title, artist FROM tracks WHERE {' OR '.join(conditions)} LIMIT ${param_num}"
-            params.append(limit)
-            
-            rows = await conn.fetch(sql, *params)
-            seen, comb = set(), []
-            for r in rows:
-                if r['id'] not in seen: 
-                    seen.add(r['id'])
-                    comb.append(r)
-                if len(comb) >= limit: 
-                    break
-            return comb[:limit]
-        except Exception as e: 
-            logging.error(f"Err2 (поиск по словам): {e}")
+            logging.error(f"❌ Ошибка поиска: {e}")
     
     return []
 
