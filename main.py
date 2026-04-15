@@ -536,6 +536,8 @@ async def main():
     # ❗ задержка перед первым SQL
     await asyncio.sleep(2)
     await init_db()
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
     
     app = web.Application()
     app.router.add_get("/", health_check)
