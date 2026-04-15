@@ -42,17 +42,28 @@ db_pool = None
 # --- БАЗА ДАННЫХ (Supabase PostgreSQL) ---
 async def init_db_pool():
     global db_pool
+
     try:
         db_pool = await asyncpg.create_pool(
             DATABASE_URL,
+            ssl="require",
             min_size=1,
             max_size=5,
-            command_timeout=60,
-            ssl="require"
+            command_timeout=60
         )
-        logging.info("✅ Пул подключений к Supabase создан")
+
+        logging.info("✅ DB pool создан")
+
+        # прогрев соединения (важно для Koyeb)
+        await asyncio.sleep(1)
+
+        async with db_pool.acquire() as conn:
+            await conn.execute("SELECT 1")
+
+        logging.info("✅ DB проверена и работает")
+
     except Exception as e:
-        logging.error(f"❌ Ошибка подключения к БД: {e}")
+        logging.error(f"❌ Ошибка БД: {e}")
         raise
 
 async def get_db():
