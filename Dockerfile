@@ -2,15 +2,10 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy bot code
 COPY main.py .
 
-# Debug: list files to verify they exist
-RUN ls -la /app/
-
-# Run the bot
-CMD ["python3", "main.py"]
+# Убиваем любые старые процессы перед запуском
+CMD pkill -9 -f main.py || true; python3 main.py
