@@ -541,34 +541,27 @@ async def main():
     await asyncio.sleep(1)
     await init_db()
 
-    # --- AIOHTTP APP ---
     app = web.Application()
     app.router.add_get("/", health_check)
 
-    # --- WEBHOOK PATH ---
     WEBHOOK_PATH = "/webhook"
 
-    # важно: WEBHOOK_URL должен быть в ENV
     webhook_url = os.environ.get("WEBHOOK_URL")
     if not webhook_url:
         raise ValueError("WEBHOOK_URL is not set")
 
-    # --- DELETE OLD WEBHOOK ---
     await bot.delete_webhook(drop_pending_updates=True)
 
-    # --- SET NEW WEBHOOK ---
     await bot.set_webhook(
         url=webhook_url + WEBHOOK_PATH,
         drop_pending_updates=True
     )
 
-    # --- REGISTER HANDLER ---
     SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
     ).register(app, path=WEBHOOK_PATH)
 
-    # --- START SERVER ---
     runner = web.AppRunner(app)
     await runner.setup()
 
@@ -578,5 +571,6 @@ async def main():
 
     logging.info(f"🚀 Bot started on port {port}")
 
-    # держим процесс живым
-    await asyncio.Event().wait()
+    # 🔥 ВАЖНО: держим процесс живым правильно
+    while True:
+        await asyncio.sleep(3600)
