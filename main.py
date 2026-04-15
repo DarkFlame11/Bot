@@ -33,7 +33,7 @@ if not DATABASE_URL:
     raise ValueError("CRITICAL: Переменная DATABASE_URL не задана!")
 
 # Инициализация с правильным timeout
-session = AiohttpSession(timeout=120)
+session = AiohttpSession(timeout=60)
 bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -48,8 +48,8 @@ async def init_db_pool():
         db_pool = await asyncpg.create_pool(
             DATABASE_URL,
             ssl="require",
-            min_size=5,
-            max_size=20,
+            min_size=2,
+            max_size=10,
             command_timeout=60
         )
 
