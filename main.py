@@ -58,7 +58,7 @@ async def init_db_pool():
         await asyncio.sleep(1)
 
         async with db_pool.acquire() as conn:
-            await conn.execute("SELECT 1")
+            await conn.fetchval("SELECT 1")
 
         logging.info("✅ DB проверена и работает")
 
@@ -73,7 +73,6 @@ async def init_db():
     """Создание таблиц в Supabase"""
     pool = await get_db()
     async with pool.acquire() as conn:
-    await conn.fetchval("SELECT 1")
         try:
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS tracks (
