@@ -544,7 +544,7 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT"))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     logging.info(f"✅ Пинг для Koyeb слушает порт {port}")
