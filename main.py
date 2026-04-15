@@ -531,16 +531,10 @@ async def dt(c: types.CallbackQuery):
 async def health_check(request):
     return web.Response(text="Bot is alive")
 
-async def main():
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = f"https://YOUR-APP-NAME.koyeb.app{WEBHOOK_PATH}"
-
-
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+    
 
     WEBHOOK_PATH = "/webhook"
     WEBHOOK_URL = f"https://distinguished-rosemaria-danielyans8d-b247c964.koyeb.app/"
