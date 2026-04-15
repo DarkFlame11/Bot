@@ -534,7 +534,7 @@ async def health_check(request):
 
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 async def main():
-    await bot.delete_webhook(drop_pending_updates=
+    await bot.delete_webhook(drop_pending_updates=True)
  
 async def main():
     await init_db_pool()
