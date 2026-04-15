@@ -534,10 +534,7 @@ async def health_check(request):
 
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 async def main():
-    await bot.delete_webhook(drop_pending_updates=True)
-    
-
-    WEBHOOK_PATH = "/webhook"
+    await bot.delete_webhook(drop_pending_updates=
  
 async def main():
     await init_db_pool()
@@ -566,7 +563,7 @@ async def main():
     )
 
     # --- aiogram webhook handler ---
-    SimpleRequestHandler(dp, bot).register(app, path=WEBHOOK_PATH)
+   SimpleRequestHandler(dispatcher=dp,bot=bot,).register(app, path="/webhook")
     setup_application(app, dp, bot)
 
     logging.info("🚀 Bot started in WEBHOOK mode")
