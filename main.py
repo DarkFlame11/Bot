@@ -52,7 +52,8 @@ async def init_db_pool():
     min_size=1,
     max_size=5,
     command_timeout=10,
-    statement_cache_size=0  # 🔥 ВАЖНО
+    statement_cache_size=0,
+     timeout=10 # 🔥 ВАЖНО
 )
 
         logging.info("✅ DB pool создан")
