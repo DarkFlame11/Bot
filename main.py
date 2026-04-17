@@ -66,7 +66,7 @@ async def init_db_pool():
 
     except Exception as e:
         logging.error(f"❌ Ошибка БД: {e}")
-        raise
+        #raise
 
 async def get_db():
     return db_pool
@@ -538,10 +538,6 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 
 
 async def main():
-    await init_db_pool()
-    #await asyncio.sleep(1)
-    await init_db()
-
     app = web.Application()
     app.router.add_get("/", health_check)
 
@@ -551,13 +547,8 @@ async def main():
     if not webhook_url:
         raise ValueError("WEBHOOK_URL is not set")
 
-    await bot.delete_webhook(drop_pending_updates=True)
-
-    await bot.set_webhook(
-        url=webhook_url + WEBHOOK_PATH,
-        drop_pending_updates=True
-    )
-
+    # регистрируем webhook handler
+    from aiogram.webhook.aiohttp_server import SimpleRequestHandler
     SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
@@ -566,13 +557,25 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
 
-    port = int(os.environ.get("PORT"))
+    port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-    logging.info(f"🚀 Bot started on port {port}")
+    logging.info(f"🚀 Server started on port {port}")
 
-    # 🔥 ВАЖНО: держим процесс живым правильно
+    # 🔥 ВАЖНО: сервер уже работает → Railway доволен
+
+    # теперь подключаем БД
+    await init_db_pool()
+    await init_db()
+
+    # ставим webhook
+    await bot.delete_webhook(drop_pending_updates=True)
+    await bot.set_webhook(url=webhook_url + WEBHOOK_PATH)
+
+    logging.info(f"✅ Webhook set: {webhook_url + WEBHOOK_PATH}")
+
+    # держим процесс живым
     while True:
         await asyncio.sleep(3600)
         
