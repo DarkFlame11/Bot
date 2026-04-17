@@ -46,12 +46,13 @@ async def init_db_pool():
 
     try:
         db_pool = await asyncpg.create_pool(
-            DATABASE_URL,
-            ssl="require",
-            min_size=1,
-            max_size=5,
-            command_timeout=10
-        )
+    DATABASE_URL,
+    ssl="require",
+    min_size=1,
+    max_size=5,
+    command_timeout=10,
+    statement_cache_size=0  # 🔥 ВАЖНО
+)
 
         logging.info("✅ DB pool создан")
 
