@@ -47,7 +47,8 @@ async def init_db_pool():
     try:
         db_pool = await asyncpg.create_pool(
     DATABASE_URL,
-    ssl="require",
+    #ssl="require",
+    ssl=False,
     min_size=1,
     max_size=5,
     command_timeout=10,
