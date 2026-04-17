@@ -551,11 +551,9 @@ async def main():
         raise ValueError("WEBHOOK_URL is not set")
 
     # регистрируем webhook handler
-    from aiogram.webhook.aiohttp_server import SimpleRequestHandler
-    SimpleRequestHandler(
-        dispatcher=dp,
-        bot=bot,
-    ).register(app, path=WEBHOOK_PATH)
+    from aiogram.webhook.aiohttp_server import setup_application
+
+    setup_application(app, dp, bot=bot)
 
     runner = web.AppRunner(app)
     await runner.setup()
