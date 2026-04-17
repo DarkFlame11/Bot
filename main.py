@@ -542,7 +542,8 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 async def main():
     app = web.Application()
     app.router.add_get("/", health_check)
-
+    app.router.add_post("/webhook", lambda request: web.Response())
+    
     WEBHOOK_PATH = "/webhook"
 
     webhook_url = os.environ.get("WEBHOOK_URL")
