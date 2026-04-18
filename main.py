@@ -1,11 +1,10 @@
 import os
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 import sys
 import asyncio
 import logging
 import html
-import random # ИСПРАВЛЕНО: Добавлен random
-import asyncpg # ИСПРАВЛЕНО: Добавлен asyncpg вместо aiosqlite
+import random
+import asyncpg
 import socket
 import urllib.parse
 from aiohttp import web
@@ -17,49 +16,47 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.client.default import DefaultBotProperties
-from aiogram.client.session.aiohttp import AiohttpSession # ИСПРАВЛЕНО: Импорт сессии
+from aiogram.client.session.aiohttp import AiohttpSession
 
 # --- НАСТРОЙКИ ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise ValueError("CRITICAL: Переменная BOT_TOKEN не задана в Koyeb!")
+    raise ValueError("CRITICAL: Переменная BOT_TOKEN не задана в Railway!")
 
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
-DATABASE_URL = os.environ.get("DATABASE_URL")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 if not DATABASE_URL:
     raise ValueError("CRITICAL: Переменная DATABASE_URL не задана!")
 
-# Инициализация с правильным timeout
+# Railway даёт postgres://, asyncpg требует postgresql://
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+# Инициализация бота
 session = AiohttpSession(timeout=60)
 bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher(storage=MemoryStorage())
 
-# Глобальный пул подключений к Supabase
+# Глобальный пул подключений
 db_pool = None
 
-# --- БАЗА ДАННЫХ (Supabase PostgreSQL) ---
+# --- БАЗА ДАННЫХ ---
 async def init_db_pool():
     global db_pool
-
     try:
         db_pool = await asyncpg.create_pool(
-    DATABASE_URL,
-    #ssl="require",
-    ssl=False,
-    min_size=1,
-    max_size=5,
-    command_timeout=10,
-    statement_cache_size=0,
-     timeout=10 # 🔥 ВАЖНО
-)
-
+            DATABASE_URL,
+            ssl="require",          # Railway PostgreSQL требует SSL
+            min_size=1,
+            max_size=5,
+            command_timeout=10,
+            statement_cache_size=0,
+            timeout=10
+        )
         logging.info("✅ DB pool создан")
-
-        # прогрев соединения (важно для Koyeb)
-        #await asyncio.sleep(1)
 
         async with db_pool.acquire() as conn:
             await conn.fetchval("SELECT 1")
@@ -68,13 +65,13 @@ async def init_db_pool():
 
     except Exception as e:
         logging.error(f"❌ Ошибка БД: {e}")
-        #raise
+        raise  # При Railway важно упасть громко, чтобы видеть в логах
 
 async def get_db():
     return db_pool
 
 async def init_db():
-    """Создание таблиц в Supabase"""
+    """Создание таблиц"""
     pool = await get_db()
     async with pool.acquire() as conn:
         try:
@@ -88,7 +85,7 @@ async def init_db():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            
+
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS favorites (
                     user_id BIGINT NOT NULL,
@@ -98,7 +95,7 @@ async def init_db():
                     FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE
                 )
             """)
-            
+
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS playlists (
                     id SERIAL PRIMARY KEY,
@@ -107,7 +104,7 @@ async def init_db():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            
+
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS playlist_tracks (
                     playlist_id INTEGER NOT NULL,
@@ -118,7 +115,7 @@ async def init_db():
                     FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE
                 )
             """)
-            
+
             logging.info("✅ База данных инициализирована")
         except Exception as e:
             logging.error(f"❌ Ошибка инициализации БД: {e}")
@@ -132,13 +129,13 @@ class PlaylistForm(StatesGroup):
 menu = ReplyKeyboardMarkup(keyboard=[
     [KeyboardButton(text="🔍 Поиск"), KeyboardButton(text="🎲 Случайный")],
     [KeyboardButton(text="🔥 Топ"), KeyboardButton(text="❤️ Избранное")],
-    [KeyboardButton(text="📋 Список Плейлистов")], 
+    [KeyboardButton(text="📋 Список Плейлистов")],
 ], resize_keyboard=True)
 
-def clean_artist(a): 
+def clean_artist(a):
     return "" if a and a.startswith("@") else (a or "")
 
-def format_track(a, t): 
+def format_track(a, t):
     return f"{a} — {t}" if clean_artist(a) else t
 
 def num_buttons(ids):
@@ -152,18 +149,18 @@ async def track_keyboard(tid, uid):
         result = await conn.fetchval("SELECT 1 FROM favorites WHERE user_id=$1 AND track_id=$2", uid, tid)
         inf = result is not None
     btn = InlineKeyboardButton(
-        text="💔 Убрать" if inf else "❤️ В избранное", 
+        text="💔 Убрать" if inf else "❤️ В избранное",
         callback_data=f"unfav_{tid}" if inf else f"fav_{tid}"
     )
     return InlineKeyboardMarkup(inline_keyboard=[
-        [btn], 
+        [btn],
         [InlineKeyboardButton(text="➕ В плейлист", callback_data=f"topl_{tid}")]
     ])
 
 # --- ПОИСК И ТРАНСЛИТЕРАЦИЯ ---
 CYR_LAT = {
     'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'yo','ж':'zh','з':'z','и':'i',
-    'й':'y','к':'k','л':'l','м':'m','н':'n','о':'o','п':'p','р':'r','с':'s','т':'t', # ИСПРАВЛЕНО: 'р':'r'
+    'й':'y','к':'k','л':'l','м':'m','н':'n','о':'o','п':'p','р':'r','с':'s','т':'t',
     'у':'u','ф':'f','х':'kh','ц':'ts','ч':'ch','ш':'sh','щ':'shch','ъ':'','ы':'y','ь':'',
     'э':'e','ю':'yu','я':'ya'
 }
@@ -178,31 +175,29 @@ LAT_CYR = {
 def translit_to_latin(text):
     result = text.lower()
     for cyr in sorted(CYR_LAT.keys(), key=len, reverse=True):
-        lat = CYR_LAT[cyr]
-        result = result.replace(cyr, lat)
+        result = result.replace(cyr, CYR_LAT[cyr])
     return result
 
 def translit_to_cyrillic(text):
     result = text.lower()
     for lat in sorted(LAT_CYR.keys(), key=len, reverse=True):
-        cyr = LAT_CYR[lat]
-        result = result.replace(lat, cyr)
+        result = result.replace(lat, LAT_CYR[lat])
     return result
 
 def get_var(q):
     q = q.lower().strip()
     if not q: return []
-    q = q.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '').replace(' ', '')
+    q = q.replace('\u200b','').replace('\u200c','').replace('\u200d','').replace(' ','')
     if not q: return []
-    
+
     v = [q]
-    has_cyrillic = any(ord(c) >= 0x0400 and ord(c) <= 0x04FF for c in q)
+    has_cyrillic = any(0x0400 <= ord(c) <= 0x04FF for c in q)
     has_latin = any(c.isascii() and c.isalpha() for c in q)
-    
+
     if has_cyrillic:
         lat = translit_to_latin(q)
         if lat and lat != q: v.append(lat)
-    
+
     if has_latin:
         cyr = translit_to_cyrillic(q)
         if cyr and cyr != q: v.append(cyr)
@@ -213,27 +208,27 @@ async def run_search(query, limit=10):
     async with pool.acquire() as conn:
         var = get_var(query)
         if not var: return []
-        
+
         try:
             all_conditions = []
             all_params = []
             param_count = 1
-            
+
             for v in var:
                 all_conditions.append(f"title ILIKE ${param_count}")
                 all_params.append(f"%{v}%")
                 param_count += 1
-                
+
                 all_conditions.append(f"artist ILIKE ${param_count}")
                 all_params.append(f"%{v}%")
                 param_count += 1
-            
+
             sql = f"SELECT DISTINCT id, title, artist FROM tracks WHERE {' OR '.join(all_conditions)} LIMIT ${param_count}"
             all_params.append(limit)
-            
+
             res = await conn.fetch(sql, *all_params)
             if res: return res
-        except Exception as e: 
+        except Exception as e:
             logging.error(f"❌ Ошибка поиска: {e}")
     return []
 
@@ -265,7 +260,7 @@ async def imp_track(m: types.Message):
     t = m.audio.title or "Unknown"
     a = m.audio.performer or "Unknown"
     f = m.audio.file_id
-    
+
     pool = await get_db()
     async with pool.acquire() as conn:
         try:
@@ -286,7 +281,7 @@ async def rnd(m: types.Message):
             offset = random.randint(0, count - 1)
             r = await conn.fetchrow("SELECT id, file_id FROM tracks LIMIT 1 OFFSET $1", offset)
             await conn.execute("UPDATE tracks SET plays=plays+1 WHERE id=$1", r['id'])
-        
+
         await m.answer_audio(r['file_id'], reply_markup=await track_keyboard(r['id'], m.from_user.id))
     except Exception as e:
         logging.error(f"Ошибка в rnd: {e}")
@@ -462,6 +457,71 @@ async def mg(m: types.Message):
         await m.answer(h, reply_markup=kb)
     except Exception as e: logging.error(f"Ошибка в mg: {e}")
 
+# ИСПРАВЛЕНО: был баг — переменная называлась r, а проверялась как t; и логика была от хэндлера удаления
+@dp.callback_query(F.data.startswith("track_"))
+async def st(c: types.CallbackQuery):
+    try:
+        tid = int(c.data.split("_")[1])
+        pool = await get_db()
+        async with pool.acquire() as conn:
+            r = await conn.fetchrow("SELECT id, file_id FROM tracks WHERE id=$1", tid)
+            if not r: await c.answer("❌ Трек не найден", show_alert=True); return
+            await conn.execute("UPDATE tracks SET plays=plays+1 WHERE id=$1", tid)
+        await c.message.answer_audio(r['file_id'], reply_markup=await track_keyboard(tid, c.from_user.id))
+        await c.answer()
+    except Exception as e: logging.error(f"Ошибка в st: {e}")
+
+# Хэндлер удаления трека (для /manage)
+@dp.callback_query(F.data.startswith("del_"))
+async def dt(c: types.CallbackQuery):
+    if c.from_user.id != ADMIN_ID: await c.answer("❌", show_alert=True); return
+    try:
+        tid = int(c.data.split("_")[1])
+        pool = await get_db()
+        async with pool.acquire() as conn:
+            result = await conn.fetchval("SELECT 1 FROM tracks WHERE id=$1", tid)
+            if not result: await c.answer("❌ Не найден", show_alert=True); return
+            await conn.execute("DELETE FROM tracks WHERE id=$1", tid)
+        await c.answer("✅ Удалено", show_alert=True)
+        try: await c.message.delete()
+        except: pass
+    except Exception as e: logging.error(f"Ошибка в dt: {e}")
+
+# Избранное — добавить
+@dp.callback_query(F.data.startswith("fav_"))
+async def fav(c: types.CallbackQuery):
+    try:
+        tid = int(c.data.split("_")[1])
+        pool = await get_db()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO favorites (user_id, track_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                c.from_user.id, tid
+            )
+        await c.answer("❤️ Добавлено в избранное", show_alert=True)
+        # Обновляем клавиатуру
+        try:
+            await c.message.edit_reply_markup(reply_markup=await track_keyboard(tid, c.from_user.id))
+        except: pass
+    except Exception as e: logging.error(f"Ошибка в fav: {e}")
+
+# Избранное — убрать
+@dp.callback_query(F.data.startswith("unfav_"))
+async def unfav(c: types.CallbackQuery):
+    try:
+        tid = int(c.data.split("_")[1])
+        pool = await get_db()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM favorites WHERE user_id=$1 AND track_id=$2",
+                c.from_user.id, tid
+            )
+        await c.answer("💔 Убрано из избранного", show_alert=True)
+        try:
+            await c.message.edit_reply_markup(reply_markup=await track_keyboard(tid, c.from_user.id))
+        except: pass
+    except Exception as e: logging.error(f"Ошибка в unfav: {e}")
+
 @dp.message(F.text & ~F.text.startswith("/"))
 async def sm(m: types.Message, state: FSMContext):
     if await state.get_state() == PlaylistForm.waiting_name.state: return
@@ -479,106 +539,57 @@ async def sm(m: types.Message, state: FSMContext):
     lines = [f"{i}. {html.escape(format_track(t['artist'], t['title']))}" for i, t in enumerate(res, 1)]
     await m.answer(f"🎧 <b>Найдено {len(res)}:</b>\n\n" + "\n".join(lines) + "\n\n👇 Нажми номер:", parse_mode="HTML", reply_markup=num_buttons([t['id'] for t in res]))
 
-@dp.callback_query(F.data.startswith("track_"))
-async def st(c: types.CallbackQuery):
-    try:
-        tid = int(c.data.split("_")[1])
-        pool = await get_db()
-        async with pool.acquire() as conn:
-            r = await conn.fetchrow("SELECT file_id FROM tracks WHERE id=$1", tid)
-            if not r: await c.answer("❌ Трек не найден", show_alert=True); return
-            await conn.execute("UPDATE tracks SET plays=plays+1 WHERE id=$1", tid)
-        await c.message.answer_audio(r['file_id'], reply_markup=await track_keyboard(tid, c.from_user.id))
-    except Exception as e:
-        logging.error(f"Ошибка аудио: {e}")
-        await c.message.answer("⚠️ Ошибка: этот аудиофайл поврежден или удален из Telegram.")
-    await c.answer()
-
-@dp.callback_query(F.data.startswith("fav_"))
-async def af(c: types.CallbackQuery):
-    try:
-        tid = int(c.data.split("_")[1])
-        pool = await get_db()
-        async with pool.acquire() as conn:
-            await conn.execute("INSERT INTO favorites (user_id, track_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", c.from_user.id, tid)
-        await c.answer("❤️")
-    except Exception as e: logging.error(f"Ошибка в af: {e}")
-
-@dp.callback_query(F.data.startswith("unfav_"))
-async def uf(c: types.CallbackQuery):
-    try:
-        tid = int(c.data.split("_")[1])
-        pool = await get_db()
-        async with pool.acquire() as conn:
-            await conn.execute("DELETE FROM favorites WHERE user_id=$1 AND track_id=$2", c.from_user.id, tid)
-        await c.answer("💔")
-        try: await c.message.delete()
-        except: pass
-    except Exception as e: logging.error(f"Ошибка в uf: {e}")
-
-@dp.callback_query(F.data.startswith("del_"))
-async def dt(c: types.CallbackQuery):
-    if c.from_user.id != ADMIN_ID: await c.answer("⛔", show_alert=True); return
-    try:
-        tid = int(c.data.split("_")[1])
-        pool = await get_db()
-        async with pool.acquire() as conn:
-            t = await conn.fetchrow("SELECT title, artist FROM tracks WHERE id=$1", tid)
-            if not t: await c.answer("❌", show_alert=True); return
-            await conn.execute("DELETE FROM tracks WHERE id=$1", tid)
-        await c.answer("✅ Удалено", show_alert=True)
-        try: await c.message.delete()
-        except: pass
-    except Exception as e: logging.error(f"Ошибка в dt: {e}")
-
-# --- ЗАПУСК ДЛЯ KOYEB ---
+# --- HEALTH CHECK ---
 async def health_check(request):
     return web.Response(text="Bot is alive")
 
-
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler
-
+# --- ЗАПУСК ДЛЯ RAILWAY ---
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 async def main():
-    app = web.Application()
-    app.router.add_get("/", health_check)
-   # app.router.add_post("/webhook", lambda request: web.Response())
-    
     WEBHOOK_PATH = "/webhook"
-
     webhook_url = os.environ.get("WEBHOOK_URL")
     if not webhook_url:
-        raise ValueError("WEBHOOK_URL is not set")
+        raise ValueError("WEBHOOK_URL не задана!")
 
-    # регистрируем webhook handler
-    from aiogram.webhook.aiohttp_server import setup_application
+    port = int(os.environ.get("PORT", 8080))  # Railway пробрасывает PORT автоматически
 
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
+
+    # Регистрируем aiogram webhook handler
+    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
 
     runner = web.AppRunner(app)
     await runner.setup()
 
-    port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-    logging.info(f"🚀 Server started on port {port}")
+    logging.info(f"🚀 Сервер запущен на порту {port}")
 
-    # 🔥 ВАЖНО: сервер уже работает → Railway доволен
-
-    # теперь подключаем БД
+    # БД подключаем ПОСЛЕ того как сервер уже слушает порт
     await init_db_pool()
     await init_db()
 
-    # ставим webhook
+    # Устанавливаем webhook
     await bot.delete_webhook(drop_pending_updates=True)
-    await bot.set_webhook(url=webhook_url + WEBHOOK_PATH)
+    full_webhook_url = webhook_url.rstrip("/") + WEBHOOK_PATH
+    await bot.set_webhook(url=full_webhook_url)
+    logging.info(f"✅ Webhook установлен: {full_webhook_url}")
 
-    logging.info(f"✅ Webhook set: {webhook_url + WEBHOOK_PATH}")
+    # Держим процесс живым
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Остановка бота...")
+        await bot.delete_webhook()
+        await runner.cleanup()
+        if db_pool:
+            await db_pool.close()
 
-    # держим процесс живым
-    while True:
-        await asyncio.sleep(3600)
-        
 if __name__ == "__main__":
     asyncio.run(main())
