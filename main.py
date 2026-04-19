@@ -29,7 +29,7 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 #CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0"))
 def get_channel_id() -> int:
     try:
-        return int(os.environ.get("CHANNEL_ID", "0"))
+        return int(os.environ.get("CHANNEL_ID", "0").strip())
     except (ValueError, TypeError):
         return 0
  
