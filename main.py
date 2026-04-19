@@ -1,4 +1,4 @@
-import os
+"import os
 import math
 import asyncio
 import logging
@@ -26,7 +26,13 @@ if not BOT_TOKEN:
     raise ValueError("CRITICAL: Переменная BOT_TOKEN не задана!")
  
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0"))
+ 
+def get_channel_id() -> int:
+    try:
+        return int(os.environ.get("CHANNEL_ID", "0"))
+    except (ValueError, TypeError):
+        return 0
+ 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
  
 if not DATABASE_URL:
@@ -530,7 +536,7 @@ async def st(c: types.CallbackQuery):
         await c.answer()
     except Exception as e:
         logging.error(f"Ошибка в st: {e}")
-
+ 
 @dp.callback_query(F.data.startswith("del_"))
 async def dt(c: types.CallbackQuery):
     if c.from_user.id != ADMIN_ID:
@@ -755,7 +761,8 @@ def build_vote_keyboard(session_id: int, rows) -> InlineKeyboardMarkup:
  
 async def _start_vote(m: types.Message, vote_type: str, limit: int):
     if m.from_user.id != ADMIN_ID: return
-    if not CHANNEL_ID:
+    channel_id = get_channel_id()
+    if not channel_id:
         await m.answer("❌ CHANNEL_ID не задан в переменных окружения")
         return
  
@@ -793,7 +800,7 @@ async def _start_vote(m: types.Message, vote_type: str, limit: int):
     kb = build_vote_keyboard(session_id, rows)
  
     try:
-        msg = await bot.send_message(CHANNEL_ID, text, parse_mode="HTML", reply_markup=kb)
+        msg = await bot.send_message(channel_id, text, parse_mode="HTML", reply_markup=kb)
     except Exception as e:
         await m.answer(f"❌ Не удалось отправить в канал: {e}")
         return
@@ -801,7 +808,7 @@ async def _start_vote(m: types.Message, vote_type: str, limit: int):
     async with pool.acquire() as conn:
         await conn.execute(
             "UPDATE vote_sessions SET channel_message_id=$1, channel_chat_id=$2 WHERE id=$3",
-            msg.message_id, CHANNEL_ID, session_id
+            msg.message_id, channel_id, session_id
         )
  
     label = "Трек дня" if vote_type == 'day' else "Трек недели"
@@ -942,19 +949,21 @@ async def handle_vote(c: types.CallbackQuery):
 # --- HEALTH CHECK ---
 WEBHOOK_PATH = "/webhook"
  
-async def health(request):
+async def health_check(request):
     return web.Response(text="ok")
  
 async def main():
+    from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+ 
     webhook_url = os.environ.get("WEBHOOK_URL", "")
     if not webhook_url:
         raise ValueError("CRITICAL: WEBHOOK_URL не задан!")
  
     port = int(os.environ.get("PORT", 8080))
  
-    from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
     app = web.Application()
-    app.router.add_get("/health", health)
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
  
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
