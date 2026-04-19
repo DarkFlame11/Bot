@@ -854,6 +854,22 @@ async def _close_vote(m: types.Message, vote_type: str):
         )
     else:
         await m.answer("✅ Голосование закрыто. Голосов не было.")
+
+#########
+
+@dp.message(Command("debugenv"))
+async def debug_env(m: types.Message):
+    if m.from_user.id != ADMIN_ID: return
+    raw = os.environ.get("CHANNEL_ID")
+    parsed = get_channel_id()
+    await m.answer(
+        f"<b>Диагностика CHANNEL_ID</b>\n\n"
+        f"Сырое значение: <code>{repr(raw)}</code>\n"
+        f"После парсинга: <code>{parsed}</code>",
+        parse_mode="HTML"
+    )"
+
+############
  
 @dp.message(Command("startday"))
 async def start_day(m: types.Message):
