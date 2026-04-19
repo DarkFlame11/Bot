@@ -26,7 +26,7 @@ if not BOT_TOKEN:
     raise ValueError("CRITICAL: Переменная BOT_TOKEN не задана!")
  
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
- 
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0"))
 def get_channel_id() -> int:
     try:
         return int(os.environ.get("CHANNEL_ID", "0"))
