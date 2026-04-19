@@ -1,4 +1,5 @@
 import os
+import math
 import asyncio
 import logging
 import html
@@ -32,7 +33,6 @@ if not DATABASE_URL:
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# Определяем нужен ли SSL (Railway требует, Replit — нет)
 USE_SSL = "railway" in DATABASE_URL or os.environ.get("DB_SSL", "").lower() == "true"
 
 session = AiohttpSession(timeout=60)
@@ -44,13 +44,7 @@ db_pool = None
 # --- БАЗА ДАННЫХ ---
 async def init_db_pool():
     global db_pool
-    kwargs = dict(
-        min_size=1,
-        max_size=5,
-        command_timeout=10,
-        statement_cache_size=0,
-        timeout=10,
-    )
+    kwargs = dict(min_size=1, max_size=5, command_timeout=10, statement_cache_size=0, timeout=10)
     if USE_SSL:
         kwargs["ssl"] = "require"
     try:
@@ -144,7 +138,7 @@ async def track_keyboard(tid, uid):
         [InlineKeyboardButton(text="➕ В плейлист", callback_data=f"topl_{tid}")]
     ])
 
-# --- ПОИСК И ТРАНСЛИТЕРАЦИЯ ---
+# --- ТРАНСЛИТЕРАЦИЯ ---
 CYR_LAT = {
     'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'yo','ж':'zh','з':'z','и':'i',
     'й':'y','к':'k','л':'l','м':'m','н':'n','о':'o','п':'p','р':'r','с':'s','т':'t',
@@ -187,30 +181,47 @@ def get_var(q):
         if cyr and cyr != q: v.append(cyr)
     return v
 
-# LIMIT + OFFSET для пагинации
-async def run_search(query, limit=10, offset=0):
+# --- ПОИСК ---
+PAGE_SIZE = 10
+
+def _search_conditions(var):
+    conditions, params, p = [], [], 1
+    for v in var:
+        conditions.append(f"title ILIKE ${p}")
+        params.append(f"%{v}%")
+        p += 1
+        conditions.append(f"artist ILIKE ${p}")
+        params.append(f"%{v}%")
+        p += 1
+    return conditions, params, p
+
+async def count_search(query) -> int:
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        var = get_var(query)
+        if not var: return 0
+        try:
+            conditions, params, _ = _search_conditions(var)
+            sql = f"SELECT COUNT(*) FROM (SELECT DISTINCT id FROM tracks WHERE {' OR '.join(conditions)}) t"
+            return await conn.fetchval(sql, *params)
+        except Exception as e:
+            logging.error(f"❌ Ошибка count_search: {e}")
+    return 0
+
+async def run_search(query, offset=0):
     pool = await get_db()
     async with pool.acquire() as conn:
         var = get_var(query)
         if not var: return []
         try:
-            conditions = []
-            params = []
-            p = 1
-            for v in var:
-                conditions.append(f"title ILIKE ${p}")
-                params.append(f"%{v}%")
-                p += 1
-                conditions.append(f"artist ILIKE ${p}")
-                params.append(f"%{v}%")
-                p += 1
+            conditions, params, p = _search_conditions(var)
             sql = (
                 f"SELECT DISTINCT id, title, artist FROM tracks "
                 f"WHERE {' OR '.join(conditions)} "
                 f"ORDER BY id "
                 f"LIMIT ${p} OFFSET ${p+1}"
             )
-            params.extend([limit, offset])
+            params.extend([PAGE_SIZE, offset])
             return await conn.fetch(sql, *params)
         except Exception as e:
             logging.error(f"❌ Ошибка поиска: {e}")
@@ -535,19 +546,32 @@ async def unfav(c: types.CallbackQuery):
 
 # --- ПОИСК С ПАГИНАЦИЕЙ ---
 
-_QUERY_MAX_LEN = 50  # под лимит callback_data в 64 байта
+_QUERY_MAX_LEN = 50  # callback_data лимит 64 байта; "pg_{offset}:{query}"
 
-def build_search_keyboard(track_ids: list, offset: int, query: str) -> InlineKeyboardMarkup:
+def build_search_keyboard(track_ids: list, offset: int, total: int, query: str) -> InlineKeyboardMarkup:
     rows = num_buttons(track_ids)
-    if len(track_ids) == 10:
-        next_offset = offset + 10
-        rows.append([
-            InlineKeyboardButton(
-                text="➡️ Ещё 10",
-                callback_data=f"more_{next_offset}:{query[:_QUERY_MAX_LEN]}"
-            )
-        ])
+    q = query[:_QUERY_MAX_LEN]
+    nav = []
+    if offset > 0:
+        nav.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"pg_{offset - PAGE_SIZE}:{q}"))
+    if offset + PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"pg_{offset + PAGE_SIZE}:{q}"))
+    if nav:
+        rows.append(nav)
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def build_search_text(res: list, offset: int, total: int, query: str) -> str:
+    page_num = offset // PAGE_SIZE + 1
+    total_pages = max(1, math.ceil(total / PAGE_SIZE))
+    lines = [
+        f"{offset + i}. {html.escape(format_track(t['artist'], t['title']))}"
+        for i, t in enumerate(res, 1)
+    ]
+    header = (
+        f"🔎 <b>«{html.escape(query)}»</b>\n"
+        f"Найдено: <b>{total}</b> • Страница <b>{page_num}</b> из <b>{total_pages}</b>\n\n"
+    )
+    return header + "\n".join(lines) + "\n\n👇 Нажми номер:"
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def sm(m: types.Message, state: FSMContext):
@@ -557,7 +581,7 @@ async def sm(m: types.Message, state: FSMContext):
     if not q:
         return
 
-    res = await run_search(q, limit=10, offset=0)
+    total, res = await asyncio.gather(count_search(q), run_search(q, offset=0))
 
     if not res:
         pool = await get_db()
@@ -569,66 +593,32 @@ async def sm(m: types.Message, state: FSMContext):
             logging.error(f"Ошибка в sm: {e}")
         return
 
-    lines = [
-        f"{i}. {html.escape(format_track(t['artist'], t['title']))}"
-        for i, t in enumerate(res, 1)
-    ]
-    text = f"🎧 <b>Найдено {len(res)}:</b>\n\n" + "\n".join(lines) + "\n\n👇 Нажми номер:"
-    kb = build_search_keyboard([t['id'] for t in res], offset=0, query=q)
+    text = build_search_text(res, offset=0, total=total, query=q)
+    kb = build_search_keyboard([t['id'] for t in res], offset=0, total=total, query=q)
     await m.answer(text, parse_mode="HTML", reply_markup=kb)
 
-@dp.callback_query(F.data.startswith("more_"))
-async def more_results(c: types.CallbackQuery):
+@dp.callback_query(F.data.startswith("pg_"))
+async def page_nav(c: types.CallbackQuery):
     try:
-        raw = c.data[5:]  # убираем "more_"
+        raw = c.data[3:]
         sep = raw.index(":")
         offset = int(raw[:sep])
-        query = raw[sep+1:]
+        query = raw[sep + 1:]
 
-        res = await run_search(query, limit=10, offset=offset)
+        total, res = await asyncio.gather(count_search(query), run_search(query, offset=offset))
 
         if not res:
-            await c.answer("Больше результатов нет", show_alert=True)
-            try:
-                old_kb = c.message.reply_markup
-                if old_kb:
-                    new_rows = [row for row in old_kb.inline_keyboard if not any(
-                        btn.callback_data and btn.callback_data.startswith("more_") for btn in row
-                    )]
-                    await c.message.edit_reply_markup(
-                        reply_markup=InlineKeyboardMarkup(inline_keyboard=new_rows) if new_rows else None
-                    )
-            except: pass
+            await c.answer("Треков на этой странице нет", show_alert=True)
             return
 
-        start_num = offset + 1
-        new_lines = [
-            f"{start_num + i}. {html.escape(format_track(t['artist'], t['title']))}"
-            for i, t in enumerate(res)
-        ]
+        text = build_search_text(res, offset=offset, total=total, query=query)
+        kb = build_search_keyboard([t['id'] for t in res], offset=offset, total=total, query=query)
 
-        old_text = c.message.text or c.message.html_text or ""
-        suffix = "\n\n👇 Нажми номер:"
-        if old_text.endswith(suffix):
-            old_text = old_text[:-len(suffix)]
-
-        new_text = old_text + "\n" + "\n".join(new_lines) + suffix
-        kb = build_search_keyboard([t['id'] for t in res], offset=offset, query=query)
-
-        try:
-            await c.message.edit_text(new_text, parse_mode="HTML", reply_markup=kb)
-        except Exception as edit_err:
-            logging.warning(f"edit_text не удался ({edit_err}), отправляем новым сообщением")
-            await c.message.answer(
-                f"🎧 <b>Ещё:</b>\n\n" + "\n".join(new_lines) + suffix,
-                parse_mode="HTML",
-                reply_markup=kb
-            )
-
+        await c.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
         await c.answer()
 
     except Exception as e:
-        logging.error(f"Ошибка в more_results: {e}")
+        logging.error(f"Ошибка в page_nav: {e}")
         await c.answer("❌ Ошибка", show_alert=True)
 
 # --- КОМАНДЫ АДМИНА ---
