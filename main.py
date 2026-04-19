@@ -867,7 +867,7 @@ async def debug_env(m: types.Message):
         f"Сырое значение: <code>{repr(raw)}</code>\n"
         f"После парсинга: <code>{parsed}</code>",
         parse_mode="HTML"
-    )"
+    )
 
 ############
  
