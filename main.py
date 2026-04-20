@@ -687,7 +687,7 @@ async def mg_cmd(m: types.Message):
         lines = [f"{i+1}. {html.escape(format_track(r['artist'], r['title']))}" for i, r in enumerate(res)]
         h = "🎵 <b>Последние 10 треков:</b>\n\n" + "\n".join(lines)
         kb_rows = num_buttons(ids)
-        kb_rows.append([InlineKeyboardButton(text=f"🗑 Удалить #{r['id']}", callback_data=f"del_{r['id']}")] for r in res)
+        #kb_rows.append([InlineKeyboardButton(text=f"🗑 Удалить #{r['id']}", callback_data=f"del_{r['id']}")] for r in res)
         del_row = [InlineKeyboardButton(text=f"🗑#{r['id']}", callback_data=f"del_{r['id']}") for r in res]
         kb = InlineKeyboardMarkup(inline_keyboard=kb_rows + [del_row])
         await m.answer(h, reply_markup=kb, parse_mode="HTML")
