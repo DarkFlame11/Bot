@@ -9,7 +9,7 @@ import asyncpg
 
 from aiohttp import web
 
-from aiogram import Bot, Dispatcher, F, types
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -64,6 +64,33 @@ async def init_db_pool():
 
 async def get_db():
     return db_pool
+
+async def register_user(user: types.User):
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO users (user_id, username, first_name, last_name)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    username = EXCLUDED.username,
+                    first_name = EXCLUDED.first_name,
+                    last_name = EXCLUDED.last_name,
+                    last_seen = CURRENT_TIMESTAMP,
+                    is_active = TRUE
+            """, user.id, user.username, user.first_name, user.last_name)
+    except Exception as e:
+        logging.error(f"Ошибка регистрации пользователя: {e}")
+
+class RegisterUserMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user = None
+        if isinstance(event, types.Message) and event.from_user:
+            user = event.from_user
+        elif isinstance(event, types.CallbackQuery) and event.from_user:
+            user = event.from_user
+        if user and not user.is_bot:
+            await register_user(user)
+        return await handler(event, data)
 
 async def init_db():
     pool = await get_db()
@@ -138,11 +165,32 @@ async def init_db():
                 FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE
             )
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                is_active BOOLEAN DEFAULT TRUE,
+                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tracks_title_trgm ON tracks USING GIN (title gin_trgm_ops)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tracks_artist_trgm ON tracks USING GIN (artist gin_trgm_ops)"
+        )
         logging.info("✅ База данных инициализирована")
 
 # --- СОСТОЯНИЯ ---
 class PlaylistForm(StatesGroup):
     waiting_name = State()
+
+class BroadcastForm(StatesGroup):
+    waiting_text = State()
 
 # --- КОНСТАНТЫ ---
 PAGE_SIZE = 10
@@ -254,37 +302,27 @@ def _search_conditions(var):
         p += 1
     return conditions, params, p
 
-async def count_search(query) -> int:
-    pool = await get_db()
-    async with pool.acquire() as conn:
-        var = get_var(query)
-        if not var: return 0
-        try:
-            conditions, params, _ = _search_conditions(var)
-            sql = f"SELECT COUNT(*) FROM (SELECT DISTINCT id FROM tracks WHERE {' OR '.join(conditions)}) t"
-            return await conn.fetchval(sql, *params)
-        except Exception as e:
-            logging.error(f"❌ Ошибка count_search: {e}")
-    return 0
-
 async def run_search(query, offset=0):
-    pool = await get_db()
-    async with pool.acquire() as conn:
+    async with db_pool.acquire() as conn:
         var = get_var(query)
-        if not var: return []
+        if not var:
+            return [], 0
         try:
             conditions, params, p = _search_conditions(var)
             sql = (
-                f"SELECT DISTINCT id, title, artist FROM tracks "
-                f"WHERE {' OR '.join(conditions)} "
+                f"SELECT id, title, artist, COUNT(*) OVER() AS total "
+                f"FROM (SELECT DISTINCT id, title, artist FROM tracks "
+                f"WHERE {' OR '.join(conditions)}) sub "
                 f"ORDER BY id "
                 f"LIMIT ${p} OFFSET ${p+1}"
             )
             params.extend([PAGE_SIZE, offset])
-            return await conn.fetch(sql, *params)
+            rows = await conn.fetch(sql, *params)
+            total = rows[0]['total'] if rows else 0
+            return rows, int(total)
         except Exception as e:
             logging.error(f"❌ Ошибка поиска: {e}")
-    return []
+    return [], 0
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ПАГИНАЦИИ ---
 
@@ -781,6 +819,15 @@ async def rec_cmd(c: types.CallbackQuery):
         logging.error(f"Ошибка в rec_cmd: {e}")
         await c.answer("❌ Ошибка", show_alert=True)
 
+@dp.message(Command("cancel"))
+async def cancel_cmd(m: types.Message, state: FSMContext):
+    cur = await state.get_state()
+    if cur:
+        await state.clear()
+        await m.answer("❌ Отменено", reply_markup=menu)
+    else:
+        await m.answer("Нечего отменять", reply_markup=menu)
+
 @dp.message(Command("stats"))
 async def stats_cmd(m: types.Message):
     if m.from_user.id != ADMIN_ID: return
@@ -791,13 +838,77 @@ async def stats_cmd(m: types.Message):
             tp = await conn.fetchval("SELECT COALESCE(SUM(plays),0) FROM tracks")
             fc = await conn.fetchval("SELECT COUNT(*) FROM favorites")
             pc = await conn.fetchval("SELECT COUNT(*) FROM playlists")
+            uc = await conn.fetchval("SELECT COUNT(*) FROM users WHERE is_active = TRUE")
         await m.answer(
             f"📊 <b>Статистика</b>\n\n"
-            f"Треков: {tc}\nПрослушиваний: {tp}\nИзбранных: {fc}\nПлейлистов: {pc}",
+            f"Треков: {tc}\nПрослушиваний: {tp}\nИзбранных: {fc}\nПлейлистов: {pc}\n"
+            f"Пользователей: {uc}",
             parse_mode="HTML"
         )
     except Exception as e:
         logging.error(f"Ошибка в stats: {e}")
+
+@dp.message(Command("broadcast"))
+async def broadcast_cmd(m: types.Message, state: FSMContext):
+    if m.from_user.id != ADMIN_ID: return
+    try:
+        async with db_pool.acquire() as conn:
+            count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE is_active = TRUE")
+        await state.set_state(BroadcastForm.waiting_text)
+        await m.answer(
+            f"📢 <b>Рассылка</b>\n\n"
+            f"Активных пользователей: <b>{count}</b>\n\n"
+            f"Отправь сообщение для рассылки (текст, фото, аудио, видео, стикер).\n"
+            f"Для отмены: /cancel",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logging.error(f"Ошибка в broadcast_cmd: {e}")
+
+@dp.message(BroadcastForm.waiting_text)
+async def broadcast_send(m: types.Message, state: FSMContext):
+    await state.clear()
+    try:
+        async with db_pool.acquire() as conn:
+            users = await conn.fetch("SELECT user_id FROM users WHERE is_active = TRUE")
+        total = len(users)
+        if total == 0:
+            await m.answer("❌ Нет активных пользователей")
+            return
+        sent = 0
+        failed = 0
+        blocked = 0
+        status_msg = await m.answer(f"📤 Отправляю... 0/{total}")
+        for i, row in enumerate(users):
+            uid = row['user_id']
+            try:
+                await m.copy_to(uid)
+                sent += 1
+            except Exception as e:
+                err_text = str(e).lower()
+                if any(w in err_text for w in ("blocked", "deactivated", "not found", "forbidden", "chat not found")):
+                    blocked += 1
+                    async with db_pool.acquire() as conn:
+                        await conn.execute("UPDATE users SET is_active=FALSE WHERE user_id=$1", uid)
+                else:
+                    failed += 1
+            if (i + 1) % 25 == 0:
+                try:
+                    await status_msg.edit_text(f"📤 Отправляю... {i+1}/{total}")
+                except Exception:
+                    pass
+            await asyncio.sleep(0.05)
+        await status_msg.edit_text(
+            f"✅ <b>Рассылка завершена!</b>\n\n"
+            f"📤 Отправлено: {sent}\n"
+            f"🚫 Заблокировали бота: {blocked}\n"
+            f"❌ Другие ошибки: {failed}\n"
+            f"👥 Всего: {total}",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logging.error(f"Ошибка в broadcast_send: {e}")
+        await m.answer(f"❌ Ошибка рассылки: {e}")
 
 def build_search_keyboard(query: str, offset: int, total: int) -> InlineKeyboardMarkup:
     total_pages = math.ceil(total / PAGE_SIZE)
@@ -817,15 +928,14 @@ def build_search_keyboard(query: str, offset: int, total: int) -> InlineKeyboard
 @dp.message(F.text & ~F.text.startswith("/") & ~F.text.in_({"🔍 Поиск","🎲 Случайный","🔥 Топ","❤️ Избранное","📋 Список Плейлистов"}))
 async def search(m: types.Message, state: FSMContext):
     cur = await state.get_state()
-    if cur == PlaylistForm.waiting_name:
+    if cur in (PlaylistForm.waiting_name, BroadcastForm.waiting_text):
         return
     q = m.text.strip()
     if not q: return
-    total = await count_search(q)
+    res, total = await run_search(q, offset=0)
     if total == 0:
         await m.answer("❌ Ничего не найдено")
         return
-    res = await run_search(q, offset=0)
     ids = [r['id'] for r in res]
     lines = [f"{i+1}. {html.escape(format_track(r['artist'], r['title']))}" for i, r in enumerate(res)]
     total_pages = math.ceil(total / PAGE_SIZE)
@@ -847,11 +957,10 @@ async def page_nav(c: types.CallbackQuery):
         sep = raw.index(":")
         offset = int(raw[:sep])
         q = raw[sep+1:]
-        total = await count_search(q)
+        res, total = await run_search(q, offset=offset)
         if total == 0:
             await c.answer("❌ Ничего не найдено", show_alert=True)
             return
-        res = await run_search(q, offset=offset)
         if not res:
             await c.answer("❌ Страница не найдена", show_alert=True)
             return
@@ -1148,11 +1257,19 @@ async def health_check(request):
 async def main():
     from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
+    dp.message.middleware(RegisterUserMiddleware())
+    dp.callback_query.middleware(RegisterUserMiddleware())
+
     webhook_url = os.environ.get("WEBHOOK_URL", "")
     if not webhook_url:
-        raise ValueError("CRITICAL: WEBHOOK_URL не задан!")
+        replit_domain = os.environ.get("REPLIT_DEV_DOMAIN", "")
+        if replit_domain:
+            webhook_url = f"https://{replit_domain}"
+            logging.info(f"WEBHOOK_URL не задан, используется REPLIT_DEV_DOMAIN: {webhook_url}")
+        else:
+            raise ValueError("CRITICAL: WEBHOOK_URL не задан!")
 
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 5000))
 
     app = web.Application()
     app.router.add_get("/", health_check)
