@@ -144,6 +144,12 @@ async def init_db():
 class PlaylistForm(StatesGroup):
     waiting_name = State()
 
+# --- КОНСТАНТЫ ---
+PAGE_SIZE = 10
+FAV_PAGE_SIZE = 5
+PL_TRACK_PAGE_SIZE = 5
+MAX_PLAYLISTS = 5
+
 # --- КЛАВИАТУРЫ ---
 menu = ReplyKeyboardMarkup(keyboard=[
     [KeyboardButton(text="🔍 Поиск"), KeyboardButton(text="🎲 Случайный")],
@@ -174,7 +180,8 @@ async def track_keyboard(tid, uid):
     )
     return InlineKeyboardMarkup(inline_keyboard=[
         [btn],
-        [InlineKeyboardButton(text="➕ В плейлист", callback_data=f"topl_{tid}")]
+        [InlineKeyboardButton(text="➕ В плейлист", callback_data=f"topl_{tid}")],
+        [InlineKeyboardButton(text="🎵 Похожие", callback_data=f"rec_{tid}")]
     ])
 
 # --- ПОИСК И ТРАНСЛИТЕРАЦИЯ ---
@@ -236,8 +243,6 @@ def get_var(q):
         if cyr and cyr != q: v.append(cyr)
     return v
 
-PAGE_SIZE = 10
-
 def _search_conditions(var):
     conditions, params, p = [], [], 1
     for v in var:
@@ -280,6 +285,132 @@ async def run_search(query, offset=0):
         except Exception as e:
             logging.error(f"❌ Ошибка поиска: {e}")
     return []
+
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ПАГИНАЦИИ ---
+
+async def show_fav_page(user_id: int, page: int, target, edit: bool = False):
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        total = await conn.fetchval(
+            "SELECT COUNT(*) FROM favorites WHERE user_id=$1", user_id
+        )
+        if total == 0:
+            text = "❤️ Избранное пусто"
+            if edit:
+                try:
+                    await target.message.edit_text(text)
+                except Exception:
+                    await target.message.answer(text)
+            else:
+                await target.answer(text)
+            return
+        offset = page * FAV_PAGE_SIZE
+        res = await conn.fetch(
+            "SELECT tracks.id, tracks.title, tracks.artist FROM tracks "
+            "JOIN favorites ON tracks.id=favorites.track_id "
+            "WHERE favorites.user_id=$1 ORDER BY favorites.added_at DESC "
+            "LIMIT $2 OFFSET $3",
+            user_id, FAV_PAGE_SIZE, offset
+        )
+    total_pages = math.ceil(total / FAV_PAGE_SIZE)
+    ids = [r['id'] for r in res]
+    lines = [
+        f"{i + 1 + offset}. {html.escape(format_track(r['artist'], r['title']))}"
+        for i, r in enumerate(res)
+    ]
+    h = (
+        f"❤️ <b>Избранное</b> — {total} тр. • Стр. {page + 1}/{total_pages}\n\n"
+        + "\n".join(lines)
+    )
+    play_rows = num_buttons(ids)
+    unfav_btns = [
+        InlineKeyboardButton(text=f"💔#{r['id']}", callback_data=f"unfav_f_{r['id']}_{page}")
+        for r in res
+    ]
+    unfav_rows = [unfav_btns[i:i+5] for i in range(0, len(unfav_btns), 5)]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"favp_{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"favp_{page + 1}"))
+    rows = play_rows + unfav_rows
+    if nav:
+        rows.append(nav)
+    if total_pages > 1:
+        rows.append([InlineKeyboardButton(text=f"Стр. {page + 1} из {total_pages}", callback_data="noop")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    if edit:
+        try:
+            await target.message.edit_text(h, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            await target.message.answer(h, reply_markup=kb, parse_mode="HTML")
+    else:
+        await target.answer(h, reply_markup=kb, parse_mode="HTML")
+
+async def show_playlist_page(pid: int, user_id: int, page: int, target, edit: bool = False):
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        pl = await conn.fetchrow(
+            "SELECT name FROM playlists WHERE id=$1 AND user_id=$2", pid, user_id
+        )
+        if not pl:
+            await target.answer("❌", show_alert=True)
+            return
+        total = await conn.fetchval(
+            "SELECT COUNT(*) FROM playlist_tracks WHERE playlist_id=$1", pid
+        )
+        if total == 0:
+            text = f"📋 «{html.escape(pl['name'])}» пуст."
+            if edit:
+                try:
+                    await target.message.edit_text(text)
+                except Exception:
+                    await target.message.answer(text)
+            else:
+                await target.message.answer(text)
+            return
+        offset = page * PL_TRACK_PAGE_SIZE
+        res = await conn.fetch(
+            "SELECT tracks.id, tracks.title, tracks.artist FROM tracks "
+            "JOIN playlist_tracks ON tracks.id=playlist_tracks.track_id "
+            "WHERE playlist_tracks.playlist_id=$1 ORDER BY playlist_tracks.added_at "
+            "LIMIT $2 OFFSET $3",
+            pid, PL_TRACK_PAGE_SIZE, offset
+        )
+    total_pages = math.ceil(total / PL_TRACK_PAGE_SIZE)
+    ids = [r['id'] for r in res]
+    lines = [
+        f"{i + 1 + offset}. {html.escape(format_track(r['artist'], r['title']))}"
+        for i, r in enumerate(res)
+    ]
+    h = (
+        f"📋 «{html.escape(pl['name'])}» — {total} тр. • Стр. {page + 1}/{total_pages}\n\n"
+        + "\n".join(lines)
+    )
+    play_rows = num_buttons(ids)
+    rm_btns = [
+        InlineKeyboardButton(text=f"🗑#{r['id']}", callback_data=f"rmpl_{pid}_{r['id']}_{page}")
+        for r in res
+    ]
+    rm_rows = [rm_btns[i:i+5] for i in range(0, len(rm_btns), 5)]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"oplp_{pid}_{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"oplp_{pid}_{page + 1}"))
+    rows = play_rows + rm_rows
+    if nav:
+        rows.append(nav)
+    if total_pages > 1:
+        rows.append([InlineKeyboardButton(text=f"Стр. {page + 1} из {total_pages}", callback_data="noop")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    if edit:
+        try:
+            await target.message.edit_text(h, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            await target.message.answer(h, reply_markup=kb, parse_mode="HTML")
+    else:
+        await target.message.answer(h, reply_markup=kb, parse_mode="HTML")
 
 # --- ХЭНДЛЕРЫ ---
 
@@ -343,30 +474,20 @@ async def sb(m: types.Message, state: FSMContext):
 
 @dp.message(F.text == "❤️ Избранное")
 async def sf(m: types.Message):
-    pool = await get_db()
-    async with pool.acquire() as conn:
-        try:
-            res = await conn.fetch(
-                "SELECT tracks.id, tracks.file_id FROM tracks "
-                "JOIN favorites ON tracks.id=favorites.track_id "
-                "WHERE favorites.user_id=$1",
-                m.from_user.id
-            )
-            if not res:
-                await m.answer("Пусто ❤️")
-                return
-            for t in res:
-                await conn.execute("UPDATE tracks SET plays=plays+1 WHERE id=$1", t['id'])
-                kb = InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="💔 Убрать", callback_data=f"unfav_{t['id']}")],
-                    [InlineKeyboardButton(text="➕ В плейлист", callback_data=f"topl_{t['id']}")]
-                ])
-                try:
-                    await m.answer_audio(t['file_id'], reply_markup=kb)
-                except:
-                    await m.answer("⚠️ Один из треков недоступен")
-        except Exception as e:
-            logging.error(f"Ошибка в sf: {e}")
+    try:
+        await show_fav_page(m.from_user.id, 0, m)
+    except Exception as e:
+        logging.error(f"Ошибка в sf: {e}")
+
+@dp.callback_query(F.data.startswith("favp_"))
+async def fav_page_cb(c: types.CallbackQuery):
+    try:
+        page = int(c.data.split("_")[1])
+        await show_fav_page(c.from_user.id, page, c, edit=True)
+        await c.answer()
+    except Exception as e:
+        logging.error(f"Ошибка в fav_page_cb: {e}")
+        await c.answer("❌ Ошибка", show_alert=True)
 
 @dp.message(F.text == "🔥 Топ")
 async def top(m: types.Message):
@@ -393,6 +514,7 @@ async def spl(m: types.Message, state: FSMContext):
     try:
         async with pool.acquire() as conn:
             res = await conn.fetch("SELECT id, name FROM playlists WHERE user_id=$1", m.from_user.id)
+        count = len(res)
         rows = [
             [
                 InlineKeyboardButton(text=f"📋 {html.escape(p['name'])}", callback_data=f"opl_{p['id']}"),
@@ -400,7 +522,14 @@ async def spl(m: types.Message, state: FSMContext):
             ]
             for p in res
         ]
-        rows.append([InlineKeyboardButton(text="➕ Создать", callback_data="plnew")])
+        if count < MAX_PLAYLISTS:
+            rows.append([InlineKeyboardButton(
+                text=f"➕ Создать ({count}/{MAX_PLAYLISTS})", callback_data="plnew"
+            )])
+        else:
+            rows.append([InlineKeyboardButton(
+                text=f"⛔ Лимит {MAX_PLAYLISTS} плейлиста достигнут", callback_data="noop"
+            )])
         await m.answer("📋 Плейлисты:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     except Exception as e:
         logging.error(f"Ошибка в spl: {e}")
@@ -420,6 +549,13 @@ async def rpn(m: types.Message, state: FSMContext):
     pool = await get_db()
     try:
         async with pool.acquire() as conn:
+            count = await conn.fetchval(
+                "SELECT COUNT(*) FROM playlists WHERE user_id=$1", m.from_user.id
+            )
+            if count >= MAX_PLAYLISTS:
+                await state.clear()
+                await m.answer(f"❌ Максимум {MAX_PLAYLISTS} плейлистов. Удали один перед созданием нового.")
+                return
             await conn.execute("INSERT INTO playlists (user_id, name) VALUES ($1, $2)", m.from_user.id, n)
         await state.clear()
         await m.answer(f"✅ «{html.escape(n)}» создан!")
@@ -446,35 +582,21 @@ async def dpl(c: types.CallbackQuery):
 async def opl(c: types.CallbackQuery):
     try:
         pid = int(c.data.split("_")[1])
-        pool = await get_db()
-        async with pool.acquire() as conn:
-            pl = await conn.fetchrow("SELECT name FROM playlists WHERE id=$1 AND user_id=$2", pid, c.from_user.id)
-            if not pl:
-                await c.answer("❌", show_alert=True)
-                return
-            tr = await conn.fetch(
-                "SELECT tracks.id, tracks.file_id FROM tracks "
-                "JOIN playlist_tracks ON tracks.id=playlist_tracks.track_id "
-                "WHERE playlist_tracks.playlist_id=$1",
-                pid
-            )
-            if not tr:
-                await c.message.answer(f"📋 «{html.escape(pl['name'])}» пуст.")
-                await c.answer()
-                return
-            await c.message.answer(f"📋 «{html.escape(pl['name'])}»:")
-            for t in tr:
-                await conn.execute("UPDATE tracks SET plays=plays+1 WHERE id=$1", t['id'])
-                kb = InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🗑 Убрать", callback_data=f"rmpl_{pid}_{t['id']}")]
-                ])
-                try:
-                    await c.message.answer_audio(t['file_id'], reply_markup=kb)
-                except:
-                    await c.message.answer("⚠️ Трек недоступен")
+        await show_playlist_page(pid, c.from_user.id, 0, c, edit=False)
         await c.answer()
     except Exception as e:
         logging.error(f"Ошибка в opl: {e}")
+
+@dp.callback_query(F.data.startswith("oplp_"))
+async def oplp(c: types.CallbackQuery):
+    try:
+        parts = c.data.split("_")
+        pid, page = int(parts[1]), int(parts[2])
+        await show_playlist_page(pid, c.from_user.id, page, c, edit=True)
+        await c.answer()
+    except Exception as e:
+        logging.error(f"Ошибка в oplp: {e}")
+        await c.answer("❌ Ошибка", show_alert=True)
 
 @dp.callback_query(F.data.startswith("topl_"))
 async def cpl(c: types.CallbackQuery):
@@ -517,6 +639,7 @@ async def rmpl(c: types.CallbackQuery):
     try:
         p = c.data.split("_")
         pid, tid = int(p[1]), int(p[2])
+        page = int(p[3]) if len(p) > 3 else 0
         pool = await get_db()
         async with pool.acquire() as conn:
             await conn.execute(
@@ -524,8 +647,7 @@ async def rmpl(c: types.CallbackQuery):
                 pid, tid
             )
         await c.answer("🗑 Убрано", show_alert=True)
-        try: await c.message.delete()
-        except: pass
+        await show_playlist_page(pid, c.from_user.id, page, c, edit=True)
     except Exception as e:
         logging.error(f"Ошибка в rmpl: {e}")
 
@@ -584,19 +706,80 @@ async def fav(c: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("unfav_"))
 async def unfav(c: types.CallbackQuery):
     try:
+        parts = c.data.split("_")
+        if parts[1] == "f":
+            tid = int(parts[2])
+            page = int(parts[3]) if len(parts) > 3 else 0
+            pool = await get_db()
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "DELETE FROM favorites WHERE user_id=$1 AND track_id=$2",
+                    c.from_user.id, tid
+                )
+            await c.answer("💔 Убрано из избранного", show_alert=True)
+            await show_fav_page(c.from_user.id, page, c, edit=True)
+        else:
+            tid = int(parts[1])
+            pool = await get_db()
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "DELETE FROM favorites WHERE user_id=$1 AND track_id=$2",
+                    c.from_user.id, tid
+                )
+            await c.answer("💔 Убрано из избранного", show_alert=True)
+            try:
+                await c.message.edit_reply_markup(reply_markup=await track_keyboard(tid, c.from_user.id))
+            except: pass
+    except Exception as e:
+        logging.error(f"Ошибка в unfav: {e}")
+
+# --- РЕКОМЕНДАЦИИ ---
+
+@dp.callback_query(F.data.startswith("rec_"))
+async def rec_cmd(c: types.CallbackQuery):
+    try:
         tid = int(c.data.split("_")[1])
         pool = await get_db()
         async with pool.acquire() as conn:
-            await conn.execute(
-                "DELETE FROM favorites WHERE user_id=$1 AND track_id=$2",
-                c.from_user.id, tid
-            )
-        await c.answer("💔 Убрано из избранного", show_alert=True)
-        try:
-            await c.message.edit_reply_markup(reply_markup=await track_keyboard(tid, c.from_user.id))
-        except: pass
+            track = await conn.fetchrow("SELECT id, title, artist FROM tracks WHERE id=$1", tid)
+            if not track:
+                await c.answer("❌ Трек не найден", show_alert=True)
+                return
+            recs = []
+            artist = track['artist']
+            if artist and not artist.startswith('@') and artist not in ('Unknown', ''):
+                recs = list(await conn.fetch(
+                    "SELECT id, title, artist FROM tracks "
+                    "WHERE artist ILIKE $1 AND id != $2 ORDER BY plays DESC LIMIT 5",
+                    artist, tid
+                ))
+            if len(recs) < 5:
+                need = 5 - len(recs)
+                exclude = [tid] + [r['id'] for r in recs]
+                placeholders = ', '.join(f'${i + 1}' for i in range(len(exclude)))
+                top = list(await conn.fetch(
+                    f"SELECT id, title, artist FROM tracks "
+                    f"WHERE id NOT IN ({placeholders}) "
+                    f"ORDER BY plays DESC LIMIT ${len(exclude) + 1}",
+                    *exclude, need
+                ))
+                recs += top
+        if not recs:
+            await c.answer("Похожих треков нет", show_alert=True)
+            return
+        ids = [r['id'] for r in recs]
+        lines = [
+            f"{i + 1}. {html.escape(format_track(r['artist'], r['title']))}"
+            for i, r in enumerate(recs)
+        ]
+        title_str = html.escape(format_track(track['artist'], track['title']))
+        h = f"🎵 <b>Похожие на «{title_str}»:</b>\n\n" + "\n".join(lines)
+        kb = InlineKeyboardMarkup(inline_keyboard=num_buttons(ids))
+        await c.message.answer(h, reply_markup=kb, parse_mode="HTML")
+        await c.answer()
     except Exception as e:
-        logging.error(f"Ошибка в unfav: {e}")
+        logging.error(f"Ошибка в rec_cmd: {e}")
+        await c.answer("❌ Ошибка", show_alert=True)
 
 @dp.message(Command("stats"))
 async def stats_cmd(m: types.Message):
@@ -763,7 +946,7 @@ def build_vote_text(vote_type: str, period: str, rows, closed=False) -> str:
     footer = (
         f"\n\nВсего голосов: <b>{total}</b>"
         if closed else
-        "\n\n👇🏽 Нажми на трек чтобы проголосовать • 1 голос на человека"
+        "\n\n👆 Нажми на трек чтобы проголосовать • 1 голос на человека"
     )
     return f"<b>{title}</b> — {period}\n\n" + "\n\n".join(lines) + footer
 
@@ -783,10 +966,8 @@ async def _start_vote(m: types.Message, vote_type: str, limit: int):
     if not channel_id:
         await m.answer("❌ CHANNEL_ID не задан в переменных окружения")
         return
-
     pool = await get_db()
     period = current_period(vote_type)
-
     async with pool.acquire() as conn:
         existing = await conn.fetchval(
             "SELECT id FROM vote_sessions WHERE vote_type=$1 AND period=$2", vote_type, period
@@ -795,14 +976,12 @@ async def _start_vote(m: types.Message, vote_type: str, limit: int):
             label = "сегодня" if vote_type == 'day' else "эту неделю"
             await m.answer(f"⚠️ Голосование за {label} уже запущено")
             return
-
         tracks = await conn.fetch(
             "SELECT id, title, artist FROM tracks ORDER BY plays DESC LIMIT $1", limit
         )
         if len(tracks) < 2:
             await m.answer("❌ Мало треков в базе (нужно минимум 2)")
             return
-
         session_id = await conn.fetchval(
             "INSERT INTO vote_sessions (vote_type, period) VALUES ($1, $2) RETURNING id",
             vote_type, period
@@ -812,30 +991,25 @@ async def _start_vote(m: types.Message, vote_type: str, limit: int):
                 "INSERT INTO vote_candidates (session_id, track_id) VALUES ($1, $2)",
                 session_id, t['id']
             )
-
     rows = await get_vote_counts(session_id)
     text = build_vote_text(vote_type, period, rows)
     kb = build_vote_keyboard(session_id, rows)
-
     try:
         msg = await bot.send_message(channel_id, text, parse_mode="HTML", reply_markup=kb)
     except Exception as e:
         await m.answer(f"❌ Не удалось отправить в канал: {e}")
         return
-
     async with pool.acquire() as conn:
         await conn.execute(
             "UPDATE vote_sessions SET channel_message_id=$1, channel_chat_id=$2 WHERE id=$3",
             msg.message_id, channel_id, session_id
         )
-
     label = "Трек дня" if vote_type == 'day' else "Трек недели"
     await m.answer(f"✅ Голосование «{label}» запущено! {len(tracks)} треков в списке.")
 
 async def _close_vote(m: types.Message, vote_type: str):
     if m.from_user.id != ADMIN_ID: return
     pool = await get_db()
-
     async with pool.acquire() as conn:
         session = await conn.fetchrow(
             "SELECT * FROM vote_sessions WHERE vote_type=$1 AND status='active' "
@@ -846,10 +1020,8 @@ async def _close_vote(m: types.Message, vote_type: str):
             await m.answer("❌ Нет активного голосования")
             return
         await conn.execute("UPDATE vote_sessions SET status='closed' WHERE id=$1", session['id'])
-
     rows = await get_vote_counts(session['id'])
     text = build_vote_text(vote_type, session['period'], rows, closed=True)
-
     if session['channel_message_id'] and session['channel_chat_id']:
         try:
             await bot.edit_message_text(
@@ -860,7 +1032,6 @@ async def _close_vote(m: types.Message, vote_type: str):
             )
         except Exception as e:
             logging.warning(f"Не удалось обновить сообщение в канале: {e}")
-
     if rows:
         winner = rows[0]
         total = sum(r['vote_count'] for r in rows)
@@ -928,14 +1099,12 @@ async def handle_vote(c: types.CallbackQuery):
     try:
         parts = c.data.split("_")
         session_id, track_id = int(parts[1]), int(parts[2])
-
         pool = await get_db()
         async with pool.acquire() as conn:
             session = await conn.fetchrow("SELECT * FROM vote_sessions WHERE id=$1", session_id)
             if not session or session['status'] != 'active':
                 await c.answer("❌ Голосование уже закрыто", show_alert=True)
                 return
-
             existing = await conn.fetchval(
                 "SELECT track_id FROM votes WHERE session_id=$1 AND user_id=$2",
                 session_id, c.from_user.id
@@ -946,7 +1115,6 @@ async def handle_vote(c: types.CallbackQuery):
                 else:
                     await c.answer("Ты уже проголосовал в этом голосовании", show_alert=True)
                 return
-
             is_candidate = await conn.fetchval(
                 "SELECT 1 FROM vote_candidates WHERE session_id=$1 AND track_id=$2",
                 session_id, track_id
@@ -954,24 +1122,19 @@ async def handle_vote(c: types.CallbackQuery):
             if not is_candidate:
                 await c.answer("❌ Трек не найден", show_alert=True)
                 return
-
             await conn.execute(
                 "INSERT INTO votes (session_id, track_id, user_id) VALUES ($1, $2, $3)",
                 session_id, track_id, c.from_user.id
             )
-
         rows = await get_vote_counts(session_id)
         text = build_vote_text(session['vote_type'], session['period'], rows)
         kb = build_vote_keyboard(session_id, rows)
-
         try:
             await c.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
         except: pass
-
         voted_row = next((r for r in rows if r['track_id'] == track_id), None)
         name = html.escape(format_track(voted_row['artist'], voted_row['title'])) if voted_row else "трек"
         await c.answer(f"✅ Голос за «{name}» засчитан!", show_alert=True)
-
     except Exception as e:
         logging.error(f"Ошибка в handle_vote: {e}")
         await c.answer("❌ Ошибка", show_alert=True)
