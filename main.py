@@ -34,10 +34,8 @@ def get_channel_id() -> int:
         return 0
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
-
 if not DATABASE_URL:
     raise ValueError("CRITICAL: Переменная DATABASE_URL не задана!")
-
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
@@ -187,9 +185,17 @@ CYR_LAT = {
     'э':'e','ю':'yu','я':'ya'
 }
 
+CYR_LAT_SIMPLE = {
+    'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'e','ж':'zh','з':'z','и':'i',
+    'й':'y','к':'k','л':'l','м':'m','н':'n','о':'o','п':'p','р':'r','с':'s','т':'t',
+    'у':'u','ф':'f','х':'h','ц':'ts','ч':'ch','ш':'sh','щ':'sh','ъ':'','ы':'y','ь':'',
+    'э':'e','ю':'yu','я':'ya'
+}
+
 LAT_CYR = {
-    "shch":"щ","sch":"щ","sh":"ш","ch":"ч","zh":"ж","ts":"ц","yu":"ю","ya":"я","kh":"х",
-    "yo":"ё","a":"а","b":"б","v":"в","g":"г","d":"д","e":"е","z":"з","i":"и",
+    "shch":"щ","sch":"щ","sh":"ш","ch":"ч","zh":"ж","kh":"х","ph":"ф","ts":"ц",
+    "yu":"ю","ya":"я","yo":"ё",
+    "a":"а","b":"б","v":"в","g":"г","d":"д","e":"е","z":"з","i":"и",
     "y":"и","k":"к","l":"л","m":"м","n":"н","o":"о","p":"п","r":"р","s":"с",
     "t":"т","u":"у","f":"ф","h":"х","c":"к","w":"в","x":"х","j":"й"
 }
@@ -198,6 +204,12 @@ def translit_to_latin(text):
     result = text.lower()
     for cyr in sorted(CYR_LAT.keys(), key=len, reverse=True):
         result = result.replace(cyr, CYR_LAT[cyr])
+    return result
+
+def translit_to_latin_simple(text):
+    result = text.lower()
+    for cyr in sorted(CYR_LAT_SIMPLE.keys(), key=len, reverse=True):
+        result = result.replace(cyr, CYR_LAT_SIMPLE[cyr])
     return result
 
 def translit_to_cyrillic(text):
@@ -209,7 +221,7 @@ def translit_to_cyrillic(text):
 def get_var(q):
     q = q.lower().strip()
     if not q: return []
-    q = q.replace('\u200b','').replace('\u200c','').replace('\u200d','').replace(' ','')
+    q = q.replace('\u200b','').replace('\u200c','').replace('\u200d','')
     if not q: return []
     v = [q]
     has_cyrillic = any(0x0400 <= ord(c) <= 0x04FF for c in q)
@@ -217,6 +229,8 @@ def get_var(q):
     if has_cyrillic:
         lat = translit_to_latin(q)
         if lat and lat != q: v.append(lat)
+        lat2 = translit_to_latin_simple(q)
+        if lat2 and lat2 != q and lat2 not in v: v.append(lat2)
     if has_latin:
         cyr = translit_to_cyrillic(q)
         if cyr and cyr != q: v.append(cyr)
@@ -677,22 +691,34 @@ async def page_nav(c: types.CallbackQuery):
 async def mg_cmd(m: types.Message):
     if m.from_user.id != ADMIN_ID: return
     try:
+        args = m.text.split(maxsplit=1)
+        query = args[1].strip() if len(args) > 1 else None
         pool = await get_db()
         async with pool.acquire() as conn:
-            res = await conn.fetch("SELECT id, title, artist FROM tracks ORDER BY id DESC LIMIT 10")
+            if query:
+                var = get_var(query)
+                if not var:
+                    await m.answer("❌ Пустой запрос")
+                    return
+                conditions, params, p = _search_conditions(var)
+                sql = f"SELECT id, title, artist FROM tracks WHERE {' OR '.join(conditions)} ORDER BY id DESC LIMIT 30"
+                res = await conn.fetch(sql, *params)
+                header = f"🔍 По запросу «{html.escape(query)}»:"
+            else:
+                res = await conn.fetch("SELECT id, title, artist FROM tracks ORDER BY id DESC LIMIT 30")
+                header = "🎵 <b>Последние 30 треков:</b>"
         if not res:
-            await m.answer("❌ Пусто")
+            await m.answer("❌ Ничего не найдено")
             return
-        ids = [r['id'] for r in res]
-        lines = [f"{i+1}. {html.escape(format_track(r['artist'], r['title']))}" for i, r in enumerate(res)]
-        h = "🎵 <b>Последние 10 треков:</b>\n\n" + "\n".join(lines)
-        kb_rows = num_buttons(ids)
-        #kb_rows.append([InlineKeyboardButton(text=f"🗑 Удалить #{r['id']}", callback_data=f"del_{r['id']}")] for r in res)
-        del_row = [InlineKeyboardButton(text=f"🗑#{r['id']}", callback_data=f"del_{r['id']}") for r in res]
-        kb = InlineKeyboardMarkup(inline_keyboard=kb_rows + [del_row])
+        lines = [f"{i+1}. [#{r['id']}] {html.escape(format_track(r['artist'], r['title']))}" for i, r in enumerate(res)]
+        h = header + "\n\n" + "\n".join(lines)
+        del_buttons = [InlineKeyboardButton(text=f"🗑#{r['id']}", callback_data=f"del_{r['id']}") for r in res]
+        del_rows = [del_buttons[i:i+5] for i in range(0, len(del_buttons), 5)]
+        kb = InlineKeyboardMarkup(inline_keyboard=del_rows)
         await m.answer(h, reply_markup=kb, parse_mode="HTML")
     except Exception as e:
         logging.error(f"Ошибка в mg: {e}")
+        await m.answer(f"❌ Ошибка: {e}")
 
 # --- ГОЛОСОВАНИЕ ---
 
@@ -737,7 +763,7 @@ def build_vote_text(vote_type: str, period: str, rows, closed=False) -> str:
     footer = (
         f"\n\nВсего голосов: <b>{total}</b>"
         if closed else
-        "\n\nНажми на трек чтобы проголосовать • 1 голос на человека"
+        "\n\n👆 Нажми на трек чтобы проголосовать • 1 голос на человека"
     )
     return f"<b>{title}</b> — {period}\n\n" + "\n\n".join(lines) + footer
 
@@ -753,11 +779,9 @@ def build_vote_keyboard(session_id: int, rows) -> InlineKeyboardMarkup:
 
 async def _start_vote(m: types.Message, vote_type: str, limit: int):
     if m.from_user.id != ADMIN_ID: return
-    raw = os.environ.get("CHANNEL_ID")
     channel_id = get_channel_id()
-    logging.info(f"[VOTE] CHANNEL_ID raw={repr(raw)}, parsed={channel_id}")
     if not channel_id:
-        await m.answer(f"❌ CHANNEL_ID не задан в переменных окружения\n\nDebug: raw={repr(raw)}")
+        await m.answer("❌ CHANNEL_ID не задан в переменных окружения")
         return
 
     pool = await get_db()
