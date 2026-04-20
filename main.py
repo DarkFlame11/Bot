@@ -946,7 +946,7 @@ def build_vote_text(vote_type: str, period: str, rows, closed=False) -> str:
     footer = (
         f"\n\nВсего голосов: <b>{total}</b>"
         if closed else
-        "\n\n👆 Нажми на трек чтобы проголосовать • 1 голос на человека"
+        "\n\n👇🏼 Нажми на трек чтобы проголосовать • 1 голос на человека"
     )
     return f"<b>{title}</b> — {period}\n\n" + "\n\n".join(lines) + footer
 
