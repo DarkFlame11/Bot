@@ -186,6 +186,9 @@ async def init_db():
         await conn.execute(
             "ALTER TABLE vote_sessions ADD COLUMN IF NOT EXISTS closes_at TIMESTAMP"
         )
+        await conn.execute(
+            "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+        )
         logging.info("✅ База данных инициализирована")
 
 # --- СОСТОЯНИЯ ---
