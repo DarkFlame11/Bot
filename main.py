@@ -14,7 +14,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, LabeledPrice, PreCheckoutQuery
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 
@@ -198,6 +198,9 @@ class PlaylistForm(StatesGroup):
 class BroadcastForm(StatesGroup):
     waiting_text = State()
 
+class DonateForm(StatesGroup):
+    waiting_amount = State()
+
 # --- КОНСТАНТЫ ---
 PAGE_SIZE = 10
 FAV_PAGE_SIZE = 5
@@ -209,6 +212,7 @@ menu = ReplyKeyboardMarkup(keyboard=[
     [KeyboardButton(text="🔍 Поиск"), KeyboardButton(text="🎲 Случайный")],
     [KeyboardButton(text="🔥 Топ"), KeyboardButton(text="🆕 Новое")],
     [KeyboardButton(text="❤️ Избранное"), KeyboardButton(text="📋 Список Плейлистов")],
+    [KeyboardButton(text="💝 Донат")],
 ], resize_keyboard=True)
 
 def clean_artist(a):
@@ -940,6 +944,72 @@ async def cancel_cmd(m: types.Message, state: FSMContext):
     else:
         await m.answer("Нечего отменять", reply_markup=menu)
 
+# --- ДОНАТ (Telegram Stars) ---
+DONATE_MIN = 1
+DONATE_MAX = 100000
+
+@dp.message(F.text == "💝 Донат")
+async def donate_start(m: types.Message, state: FSMContext):
+    await state.set_state(DonateForm.waiting_amount)
+    await m.answer(
+        "💝 <b>Поддержать бота</b>\n\n"
+        "Спасибо, что хочешь помочь! 🙏\n"
+        f"Введи сумму в Telegram Stars ⭐️ (от {DONATE_MIN} до {DONATE_MAX}).\n\n"
+        "Для отмены: /cancel",
+        parse_mode="HTML"
+    )
+
+@dp.message(DonateForm.waiting_amount)
+async def donate_amount(m: types.Message, state: FSMContext):
+    txt = (m.text or "").strip()
+    if not txt.isdigit():
+        await m.answer("❌ Введи целое число звёзд, например: <code>50</code>", parse_mode="HTML")
+        return
+    amount = int(txt)
+    if amount < DONATE_MIN or amount > DONATE_MAX:
+        await m.answer(f"❌ Сумма должна быть от {DONATE_MIN} до {DONATE_MAX} ⭐️")
+        return
+    await state.clear()
+    try:
+        await bot.send_invoice(
+            chat_id=m.chat.id,
+            title="Поддержка бота",
+            description=f"Донат {amount} ⭐️ на развитие бота",
+            payload=f"donate:{m.from_user.id}:{amount}",
+            currency="XTR",
+            prices=[LabeledPrice(label=f"Донат {amount} ⭐️", amount=amount)],
+        )
+    except Exception as e:
+        logging.error(f"Ошибка отправки счёта: {e}")
+        await m.answer("❌ Не удалось создать счёт. Попробуй позже.")
+
+@dp.pre_checkout_query()
+async def pre_checkout(q: PreCheckoutQuery):
+    try:
+        await bot.answer_pre_checkout_query(q.id, ok=True)
+    except Exception as e:
+        logging.error(f"Ошибка pre_checkout: {e}")
+
+@dp.message(F.successful_payment)
+async def on_payment(m: types.Message):
+    sp = m.successful_payment
+    amount = sp.total_amount
+    await m.answer(
+        f"💖 <b>Спасибо за поддержку!</b>\n\nТы задонатил <b>{amount} ⭐️</b>. Это очень помогает!",
+        parse_mode="HTML",
+        reply_markup=menu
+    )
+    if ADMIN_ID and m.from_user.id != ADMIN_ID:
+        try:
+            uname = f"@{m.from_user.username}" if m.from_user.username else m.from_user.full_name
+            await bot.send_message(
+                ADMIN_ID,
+                f"💝 Новый донат: <b>{amount} ⭐️</b>\nОт: {html.escape(uname)} (id <code>{m.from_user.id}</code>)",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logging.error(f"Не удалось уведомить админа о донате: {e}")
+
 @dp.message(Command("stats"))
 async def stats_cmd(m: types.Message):
     if m.from_user.id != ADMIN_ID: return
@@ -1071,10 +1141,10 @@ def build_search_keyboard(query: str, offset: int, total: int) -> InlineKeyboard
     rows.append([InlineKeyboardButton(text=f"Страница {current_page} из {total_pages}", callback_data="noop")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-@dp.message(F.text & ~F.text.startswith("/") & ~F.text.in_({"🔍 Поиск","🎲 Случайный","🔥 Топ","🆕 Новое","❤️ Избранное","📋 Список Плейлистов"}))
+@dp.message(F.text & ~F.text.startswith("/") & ~F.text.in_({"🔍 Поиск","🎲 Случайный","🔥 Топ","🆕 Новое","❤️ Избранное","📋 Список Плейлистов","💝 Донат"}))
 async def search(m: types.Message, state: FSMContext):
     cur = await state.get_state()
-    if cur in (PlaylistForm.waiting_name, BroadcastForm.waiting_text):
+    if cur in (PlaylistForm.waiting_name, BroadcastForm.waiting_text, DonateForm.waiting_amount):
         return
     q = m.text.strip()
     if not q: return
