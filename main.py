@@ -50,7 +50,7 @@ db_pool = None
 # --- БАЗА ДАННЫХ ---
 async def init_db_pool():
     global db_pool
-    kwargs = dict(min_size=2, max_size=10, command_timeout=10, statement_cache_size=0, timeout=10)
+    kwargs = dict(min_size=5, max_size=10, command_timeout=10, statement_cache_size=0, timeout=10)
     if USE_SSL:
         kwargs["ssl"] = "require"
     try:
