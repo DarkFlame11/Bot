@@ -50,7 +50,7 @@ db_pool = None
 # --- БАЗА ДАННЫХ ---
 async def init_db_pool():
     global db_pool
-    kwargs = dict(min_size=1, max_size=5, command_timeout=10, statement_cache_size=0, timeout=10)
+    kwargs = dict(min_size=2, max_size=10, command_timeout=10, statement_cache_size=0, timeout=10)
     if USE_SSL:
         kwargs["ssl"] = "require"
     try:
@@ -90,6 +90,40 @@ class RegisterUserMiddleware(BaseMiddleware):
             user = event.from_user
         if user and not user.is_bot:
             await register_user(user)
+        return await handler(event, data)
+
+class ThrottleMiddleware(BaseMiddleware):
+    """Антиспам: ограничивает частоту действий пользователя.
+    По умолчанию: не больше RATE_LIMIT_HITS событий за RATE_LIMIT_WINDOW секунд."""
+    RATE_LIMIT_HITS = 8
+    RATE_LIMIT_WINDOW = 5.0
+    WARN_COOLDOWN = 15.0
+
+    def __init__(self):
+        self._hits: dict[int, list[float]] = {}
+        self._last_warn: dict[int, float] = {}
+
+    async def __call__(self, handler, event, data):
+        user = getattr(event, 'from_user', None)
+        if not user or user.is_bot or user.id == ADMIN_ID:
+            return await handler(event, data)
+        now = asyncio.get_event_loop().time()
+        hits = self._hits.setdefault(user.id, [])
+        cutoff = now - self.RATE_LIMIT_WINDOW
+        hits[:] = [t for t in hits if t > cutoff]
+        hits.append(now)
+        if len(hits) > self.RATE_LIMIT_HITS:
+            last_warn = self._last_warn.get(user.id, 0)
+            if now - last_warn > self.WARN_COOLDOWN:
+                self._last_warn[user.id] = now
+                try:
+                    if isinstance(event, types.CallbackQuery):
+                        await event.answer("⏳ Слишком часто! Подожди немного.", show_alert=False)
+                    elif isinstance(event, types.Message):
+                        await event.answer("⏳ Слишком часто! Подожди пару секунд.")
+                except Exception:
+                    pass
+            return None
         return await handler(event, data)
 
 async def init_db():
@@ -188,6 +222,30 @@ async def init_db():
         )
         await conn.execute(
             "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tracks_plays ON tracks (plays DESC)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tracks_created_at ON tracks (created_at DESC)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tracks_artist ON tracks (artist)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_favorites_user ON favorites (user_id, added_at DESC)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_playlist_tracks_pl ON playlist_tracks (playlist_id, added_at DESC)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_votes_session ON votes (session_id, user_id)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vote_sessions_active ON vote_sessions (status, vote_type, created_at DESC)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_users_active ON users (is_active) WHERE is_active = TRUE"
         )
         logging.info("✅ База данных инициализирована")
 
@@ -1402,11 +1460,10 @@ async def _start_vote(m: types.Message, vote_type: str, limit: int, hours: int =
             "INSERT INTO vote_sessions (vote_type, period, closes_at) VALUES ($1, $2, $3) RETURNING id",
             vote_type, period, closes_at
         )
-        for t in tracks:
-            await conn.execute(
-                "INSERT INTO vote_candidates (session_id, track_id) VALUES ($1, $2)",
-                session_id, t['id']
-            )
+        await conn.executemany(
+            "INSERT INTO vote_candidates (session_id, track_id) VALUES ($1, $2)",
+            [(session_id, t['id']) for t in tracks]
+        )
     rows = await get_vote_counts(session_id)
     text = build_vote_text(vote_type, period, rows, closes_at=closes_at)
     kb = build_vote_keyboard(session_id, rows)
@@ -1612,11 +1669,10 @@ async def start_artist(m: types.Message):
             "VALUES ('artist', $1, $2) RETURNING id",
             canonical, closes_at
         )
-        for t in tracks:
-            await conn.execute(
-                "INSERT INTO vote_candidates (session_id, track_id) VALUES ($1, $2)",
-                session_id, t['id']
-            )
+        await conn.executemany(
+            "INSERT INTO vote_candidates (session_id, track_id) VALUES ($1, $2)",
+            [(session_id, t['id']) for t in tracks]
+        )
     rows = await get_vote_counts(session_id)
     text = build_vote_text('artist', canonical, rows, closes_at=closes_at)
     kb = build_vote_keyboard(session_id, rows)
@@ -1747,6 +1803,8 @@ async def health_check(request):
 async def main():
     from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
+    dp.message.middleware(ThrottleMiddleware())
+    dp.callback_query.middleware(ThrottleMiddleware())
     dp.message.middleware(RegisterUserMiddleware())
     dp.callback_query.middleware(RegisterUserMiddleware())
 
