@@ -1230,12 +1230,20 @@ async def mg_cmd(m: types.Message):
 
 # --- ГОЛОСОВАНИЕ ---
 
+_MONTHS_RU = ["янв", "фев", "мар", "апр", "май", "июн",
+              "июл", "авг", "сен", "окт", "ноя", "дек"]
+
 def current_period(vote_type: str) -> str:
     today = datetime.date.today()
     if vote_type == 'day':
         return today.strftime("%d.%m.%Y")
-    iso = today.isocalendar()
-    return f"{iso[0]}-W{iso[1]:02d}"
+    weekday = today.weekday()
+    monday = today - datetime.timedelta(days=weekday)
+    sunday = monday + datetime.timedelta(days=6)
+    if monday.month == sunday.month:
+        return f"{monday.day}–{sunday.day} {_MONTHS_RU[monday.month - 1]} {sunday.year}"
+    return (f"{monday.day} {_MONTHS_RU[monday.month - 1]} – "
+            f"{sunday.day} {_MONTHS_RU[sunday.month - 1]} {sunday.year}")
 
 async def get_vote_counts(session_id: int):
     pool = await get_db()
@@ -1251,12 +1259,41 @@ async def get_vote_counts(session_id: int):
             ORDER BY vote_count DESC, vc.track_id
         """, session_id)
 
-def build_vote_text(vote_type: str, period: str, rows, closed=False, closes_at=None) -> str:
-    label = "дня" if vote_type == 'day' else "недели"
-    if closed:
-        header = f"🏆 <b>Результаты голосования — Трек {label}</b>"
+def _split_period(period: str):
+    """Возвращает (date_part, artist_or_None). Период с артистом хранится как 'date|artist'."""
+    if period and '|' in period:
+        d, a = period.split('|', 1)
+        return d, a
+    return period, None
+
+def _vote_short_label(vote_type: str, period: str) -> str:
+    date_part, artist = _split_period(period)
+    if vote_type == 'day':
+        base = "Трек дня"
+    elif vote_type == 'week':
+        base = "Трек недели"
+    elif vote_type == 'artist':
+        return f"Лучшие треки {period}"
     else:
-        header = f"🗳 <b>Голосование — Трек {label}</b>"
+        return vote_type
+    return f"{base} — {artist}" if artist else base
+
+def build_vote_text(vote_type: str, period: str, rows, closed=False, closes_at=None) -> str:
+    date_part, artist = _split_period(period)
+    if vote_type == 'artist':
+        title = f"Лучшие треки — {html.escape(period)}"
+        period_suffix = ""
+    else:
+        label = "дня" if vote_type == 'day' else "недели"
+        if artist:
+            title = f"Трек {label} — {html.escape(artist)}"
+        else:
+            title = f"Трек {label}"
+        period_suffix = f" • {date_part}"
+    if closed:
+        header = f"🏆 <b>Результаты голосования — {title}</b>"
+    else:
+        header = f"🗳 <b>Голосование — {title}</b>"
     total = sum(r['vote_count'] for r in rows)
     medals = ["🥇", "🥈", "🥉"]
     lines = []
@@ -1293,7 +1330,7 @@ def build_vote_text(vote_type: str, period: str, rows, closed=False, closes_at=N
                 footer_parts.append(f"⏰ Закроется через: {h}ч {mn}мин")
         footer_parts.append("👇 Нажми на кнопку ниже чтобы проголосовать • 1 голос")
         footer = "\n".join(footer_parts)
-    return f"{header} • {period}\n\n" + "\n\n".join(lines) + f"\n\n{footer}"
+    return f"{header}{period_suffix}\n\n" + "\n\n".join(lines) + f"\n\n{footer}"
 
 def build_vote_keyboard(session_id: int, rows, closed=False) -> InlineKeyboardMarkup:
     if closed:
@@ -1312,29 +1349,55 @@ def build_vote_keyboard(session_id: int, rows, closed=False) -> InlineKeyboardMa
         )])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-async def _start_vote(m: types.Message, vote_type: str, limit: int, hours: int = None):
+async def _start_vote(m: types.Message, vote_type: str, limit: int, hours: int = None, artist: str = None):
     if m.from_user.id != ADMIN_ID: return
     channel_id = get_channel_id()
     if not channel_id:
         await m.answer("❌ CHANNEL_ID не задан в переменных окружения")
         return
-    pool = await get_db()
-    period = current_period(vote_type)
-    closes_at = datetime.datetime.utcnow() + datetime.timedelta(hours=hours) if hours else None
-    async with pool.acquire() as conn:
+    date_period = current_period(vote_type)
+    canonical_artist = None
+    async with db_pool.acquire() as conn:
+        if artist:
+            canonical_artist = await conn.fetchval(
+                "SELECT artist FROM tracks WHERE artist ILIKE $1 "
+                "GROUP BY artist ORDER BY COUNT(*) DESC LIMIT 1",
+                artist
+            )
+            if not canonical_artist:
+                await m.answer(f"❌ Исполнитель «{html.escape(artist)}» не найден в базе")
+                return
+        period = f"{date_period}|{canonical_artist}" if canonical_artist else date_period
         existing = await conn.fetchval(
-            "SELECT id FROM vote_sessions WHERE vote_type=$1 AND period=$2", vote_type, period
+            "SELECT id FROM vote_sessions WHERE vote_type=$1 AND period=$2 AND status='active'",
+            vote_type, period
         )
         if existing:
-            label = "сегодня" if vote_type == 'day' else "эту неделю"
-            await m.answer(f"⚠️ Голосование за {label} уже запущено")
+            if canonical_artist:
+                await m.answer(f"⚠️ Голосование за {html.escape(canonical_artist)} ({date_period}) уже идёт")
+            else:
+                label = "сегодня" if vote_type == 'day' else "эту неделю"
+                await m.answer(f"⚠️ Голосование за {label} уже запущено")
             return
-        tracks = await conn.fetch(
-            "SELECT id, title, artist FROM tracks ORDER BY plays DESC LIMIT $1", limit
-        )
+        if canonical_artist:
+            tracks = await conn.fetch(
+                "SELECT id, title, artist FROM tracks WHERE artist=$1 "
+                "ORDER BY plays DESC, id LIMIT $2",
+                canonical_artist, limit
+            )
+        else:
+            tracks = await conn.fetch(
+                "SELECT id, title, artist FROM tracks ORDER BY plays DESC LIMIT $1", limit
+            )
         if len(tracks) < 2:
-            await m.answer("❌ Мало треков в базе (нужно минимум 2)")
+            who = f"у {html.escape(canonical_artist)}" if canonical_artist else "в базе"
+            await m.answer(f"❌ Мало треков {who} (нужно минимум 2)")
             return
+        await conn.execute(
+            "DELETE FROM vote_sessions WHERE vote_type=$1 AND period=$2 AND status<>'active'",
+            vote_type, period
+        )
+        closes_at = datetime.datetime.utcnow() + datetime.timedelta(hours=hours) if hours else None
         session_id = await conn.fetchval(
             "INSERT INTO vote_sessions (vote_type, period, closes_at) VALUES ($1, $2, $3) RETURNING id",
             vote_type, period, closes_at
@@ -1352,14 +1415,14 @@ async def _start_vote(m: types.Message, vote_type: str, limit: int, hours: int =
     except Exception as e:
         await m.answer(f"❌ Не удалось отправить в канал: {e}")
         return
-    async with pool.acquire() as conn:
+    async with db_pool.acquire() as conn:
         await conn.execute(
             "UPDATE vote_sessions SET channel_message_id=$1, channel_chat_id=$2 WHERE id=$3",
             msg.message_id, channel_id, session_id
         )
-    label_name = "Трек дня" if vote_type == 'day' else "Трек недели"
+    label_name = _vote_short_label(vote_type, period)
     timer_info = f" Закроется через {hours}ч." if hours else ""
-    await m.answer(f"✅ Голосование «{label_name}» запущено! {len(tracks)} треков.{timer_info}")
+    await m.answer(f"✅ Голосование «{html.escape(label_name)}» запущено! {len(tracks)} треков.{timer_info}", parse_mode="HTML")
 
 async def _do_close_vote(session: dict):
     """Закрыть голосование по объекту сессии (используется вручную и авто-таймером)."""
@@ -1421,10 +1484,10 @@ async def vote_auto_close_loop():
                 try:
                     await _do_close_vote(dict(session))
                     if ADMIN_ID:
-                        label = "Трек дня" if session['vote_type'] == 'day' else "Трек недели"
+                        label = _vote_short_label(session['vote_type'], session['period'])
                         await bot.send_message(
                             ADMIN_ID,
-                            f"⏰ Голосование «{label}» ({session['period']}) автоматически закрыто.",
+                            f"⏰ Голосование «{label}» автоматически закрыто.",
                         )
                 except Exception as e:
                     logging.error(f"Ошибка авто-закрытия голосования #{session['id']}: {e}")
@@ -1457,25 +1520,36 @@ def _parse_hours(arg: str):
         return h, None
     return None, f"❌ Неверный формат времени: <code>{html.escape(stripped)}</code>\nУкажи целое число часов, например: /startday 24"
 
+def _parse_artist_and_hours(text: str):
+    """Разбирает '<команда> [артист...] [часов]'. Возвращает (artist_or_None, hours_or_None, err_or_None)."""
+    parts = text.split()[1:]
+    hours = None
+    if parts and parts[-1].isdigit():
+        h, err = _parse_hours(parts[-1])
+        if err:
+            return None, None, err
+        hours = h
+        parts = parts[:-1]
+    artist = " ".join(parts).strip() or None
+    return artist, hours, None
+
 @dp.message(Command("startday"))
 async def start_day(m: types.Message):
     if m.from_user.id != ADMIN_ID: return
-    args = m.text.split(maxsplit=1)
-    hours, err = _parse_hours(args[1] if len(args) > 1 else "")
+    artist, hours, err = _parse_artist_and_hours(m.text)
     if err:
         await m.answer(err, parse_mode="HTML")
         return
-    await _start_vote(m, 'day', limit=5, hours=hours)
+    await _start_vote(m, 'day', limit=5, hours=hours, artist=artist)
 
 @dp.message(Command("startweek"))
 async def start_week(m: types.Message):
     if m.from_user.id != ADMIN_ID: return
-    args = m.text.split(maxsplit=1)
-    hours, err = _parse_hours(args[1] if len(args) > 1 else "")
+    artist, hours, err = _parse_artist_and_hours(m.text)
     if err:
         await m.answer(err, parse_mode="HTML")
         return
-    await _start_vote(m, 'week', limit=10, hours=hours)
+    await _start_vote(m, 'week', limit=10, hours=hours, artist=artist)
 
 @dp.message(Command("closeday"))
 async def close_day(m: types.Message):
@@ -1484,6 +1558,117 @@ async def close_day(m: types.Message):
 @dp.message(Command("closeweek"))
 async def close_week(m: types.Message):
     await _close_vote(m, 'week')
+
+@dp.message(Command("startartist"))
+async def start_artist(m: types.Message):
+    if m.from_user.id != ADMIN_ID: return
+    args = m.text.split(maxsplit=2)
+    if len(args) < 2:
+        await m.answer(
+            "Использование: <code>/startartist &lt;исполнитель&gt; [часов]</code>\n"
+            "Например: <code>/startartist Eminem 24</code>",
+            parse_mode="HTML"
+        )
+        return
+    artist_query = args[1].strip()
+    hours, err = _parse_hours(args[2] if len(args) > 2 else "")
+    if err:
+        await m.answer(err, parse_mode="HTML")
+        return
+    channel_id = get_channel_id()
+    if not channel_id:
+        await m.answer("❌ CHANNEL_ID не задан в переменных окружения")
+        return
+    async with db_pool.acquire() as conn:
+        canonical = await conn.fetchval(
+            "SELECT artist FROM tracks WHERE artist ILIKE $1 "
+            "GROUP BY artist ORDER BY COUNT(*) DESC LIMIT 1",
+            artist_query
+        )
+        if not canonical:
+            await m.answer(f"❌ Исполнитель «{html.escape(artist_query)}» не найден в базе")
+            return
+        existing = await conn.fetchval(
+            "SELECT id FROM vote_sessions WHERE vote_type='artist' AND period=$1 AND status='active'",
+            canonical
+        )
+        if existing:
+            await m.answer(f"⚠️ Голосование за {html.escape(canonical)} уже идёт")
+            return
+        tracks = await conn.fetch(
+            "SELECT id, title, artist FROM tracks WHERE artist=$1 ORDER BY plays DESC, id LIMIT 10",
+            canonical
+        )
+        if len(tracks) < 2:
+            await m.answer(f"❌ У {html.escape(canonical)} меньше 2 треков в базе")
+            return
+        await conn.execute(
+            "DELETE FROM vote_sessions WHERE vote_type='artist' AND period=$1 AND status<>'active'",
+            canonical
+        )
+        closes_at = datetime.datetime.utcnow() + datetime.timedelta(hours=hours) if hours else None
+        session_id = await conn.fetchval(
+            "INSERT INTO vote_sessions (vote_type, period, closes_at) "
+            "VALUES ('artist', $1, $2) RETURNING id",
+            canonical, closes_at
+        )
+        for t in tracks:
+            await conn.execute(
+                "INSERT INTO vote_candidates (session_id, track_id) VALUES ($1, $2)",
+                session_id, t['id']
+            )
+    rows = await get_vote_counts(session_id)
+    text = build_vote_text('artist', canonical, rows, closes_at=closes_at)
+    kb = build_vote_keyboard(session_id, rows)
+    try:
+        msg = await bot.send_message(channel_id, text, parse_mode="HTML", reply_markup=kb)
+    except Exception as e:
+        await m.answer(f"❌ Не удалось отправить в канал: {e}")
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE vote_sessions SET channel_message_id=$1, channel_chat_id=$2 WHERE id=$3",
+            msg.message_id, channel_id, session_id
+        )
+    timer_info = f" Закроется через {hours}ч." if hours else ""
+    await m.answer(
+        f"✅ Голосование «Лучшие треки {html.escape(canonical)}» запущено! "
+        f"{len(tracks)} треков (по числу прослушиваний).{timer_info}",
+        parse_mode="HTML"
+    )
+
+@dp.message(Command("closeartist"))
+async def close_artist(m: types.Message):
+    if m.from_user.id != ADMIN_ID: return
+    args = m.text.split(maxsplit=1)
+    artist_query = args[1].strip() if len(args) > 1 else None
+    async with db_pool.acquire() as conn:
+        if artist_query:
+            session = await conn.fetchrow(
+                "SELECT * FROM vote_sessions WHERE vote_type='artist' AND status='active' "
+                "AND period ILIKE $1 ORDER BY created_at DESC LIMIT 1",
+                artist_query
+            )
+        else:
+            session = await conn.fetchrow(
+                "SELECT * FROM vote_sessions WHERE vote_type='artist' AND status='active' "
+                "ORDER BY created_at DESC LIMIT 1"
+            )
+    if not session:
+        await m.answer("❌ Нет активного голосования по исполнителю")
+        return
+    rows = await _do_close_vote(dict(session))
+    if rows:
+        winner = rows[0]
+        total = sum(r['vote_count'] for r in rows)
+        winner_name = html.escape(format_track(winner['artist'], winner['title']))
+        await m.answer(
+            f"✅ Голосование закрыто.\n🏆 Победитель: <b>{winner_name}</b>\n"
+            f"👥 Всего голосов: {total}",
+            parse_mode="HTML"
+        )
+    else:
+        await m.answer("✅ Голосование закрыто.")
 
 @dp.message(Command("votestatus"))
 async def vote_status(m: types.Message):
@@ -1499,11 +1684,11 @@ async def vote_status(m: types.Message):
     for s in sessions:
         rows = await get_vote_counts(s['id'])
         total = sum(r['vote_count'] for r in rows)
-        label = "Трек дня" if s['vote_type'] == 'day' else "Трек недели"
+        label = _vote_short_label(s['vote_type'], s['period'])
         lines = [f"{i+1}. {html.escape(format_track(r['artist'], r['title']))} — {r['vote_count']} гол."
                  for i, r in enumerate(rows)]
         await m.answer(
-            f"📊 <b>{label}</b> ({s['period']})\nВсего голосов: {total}\n\n" + "\n".join(lines),
+            f"📊 <b>{html.escape(label)}</b>\nВсего голосов: {total}\n\n" + "\n".join(lines),
             parse_mode="HTML"
         )
 
