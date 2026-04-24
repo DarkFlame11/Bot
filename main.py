@@ -1386,7 +1386,7 @@ def build_vote_text(vote_type: str, period: str, rows, closed=False, closes_at=N
                 h = int(delta.total_seconds() // 3600)
                 mn = int((delta.total_seconds() % 3600) // 60)
                 footer_parts.append(f"⏰ Закроется через: {h}ч {mn}мин")
-        footer_parts.append("👇 Нажми на кнопку ниже чтобы проголосовать • 1 голос")
+        footer_parts.append("👇🏼 Нажми на кнопку ниже чтобы проголосовать • 1 голос")
         footer = "\n".join(footer_parts)
     return f"{header}{period_suffix}\n\n" + "\n\n".join(lines) + f"\n\n{footer}"
 
