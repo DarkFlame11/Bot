@@ -1,10 +1,12 @@
 import os
+import re
 import math
 import asyncio
 import logging
 import html
 import random
 import datetime
+import unicodedata
 import asyncpg
 
 from aiohttp import web
@@ -1593,48 +1595,94 @@ async def debug_env(m: types.Message):
         parse_mode="HTML"
     )
 
+_WS_RE = re.compile(r'\s+')
+
+def _normalize_str(s: str) -> str:
+    """Нормализует строку для сравнения: убирает невидимые символы,
+    NFKC-нормализация, нижний регистр, обрезка и схлопывание пробелов."""
+    if not s:
+        return ""
+    for ch in ('\u200b', '\u200c', '\u200d', '\ufeff', '\u00a0'):
+        s = s.replace(ch, ' ' if ch == '\u00a0' else '')
+    s = unicodedata.normalize('NFKC', s)
+    s = s.lower().strip()
+    s = _WS_RE.sub(' ', s)
+    return s
+
+def _artist_keys(name: str) -> set:
+    """Множество ключей для сравнения имени артиста: нормализованные
+    варианты + версии без пробелов + транслитерации (кириллица↔латиница)."""
+    keys = set()
+    n = _normalize_str(name)
+    if not n:
+        return keys
+    keys.add(n)
+    keys.add(n.replace(' ', ''))
+    for v in get_var(n):
+        nv = _normalize_str(v)
+        if nv:
+            keys.add(nv)
+            keys.add(nv.replace(' ', ''))
+    return keys
+
 async def _find_artist_candidates(conn, query: str, limit: int = 8):
-    """Возвращает список словарей {artist, track_count, exact} по запросу.
-    Использует те же варианты транслитерации, что и обычный поиск треков
-    (кириллица ↔ латиница), плюс точное и подстрочное совпадение.
-    Сортировка: точные совпадения сверху, затем по числу треков."""
-    q = (query or "").strip()
-    if not q:
-        return []
-    variants = list(dict.fromkeys(v for v in get_var(q) if v))
-    if not variants:
+    """Ищет артистов в Python — это надёжнее, чем чистый SQL ILIKE,
+    потому что мы можем нормализовать невидимые символы, схлопнуть
+    повторные пробелы, применить NFKC и translit-варианты с обеих сторон.
+    Возвращает [{"artist", "track_count", "exact"}] по убыванию релевантности.
+    """
+    q_keys = _artist_keys(query)
+    if not q_keys:
         return []
 
-    placeholders = ",".join(f"${i+1}" for i in range(len(variants)))
-    exact_rows = await conn.fetch(
-        f"SELECT artist, COUNT(*) AS track_count "
-        f"FROM tracks "
-        f"WHERE LOWER(TRIM(artist)) = ANY(ARRAY[{placeholders}]::text[]) "
-        f"GROUP BY artist "
-        f"ORDER BY track_count DESC, artist "
-        f"LIMIT {int(limit)}",
-        *variants
-    )
-    if exact_rows:
-        return [{"artist": r["artist"], "track_count": r["track_count"], "exact": True}
-                for r in exact_rows]
+    q_norm = _normalize_str(query)
+    q_subs = set(k for k in q_keys if k)
+    q_tokens = [t for t in q_norm.split(' ') if t]
 
-    conds, params, p = [], [], 1
-    for v in variants:
-        conds.append(f"artist ILIKE ${p}")
-        params.append(f"%{_esc_like(v)}%")
-        p += 1
-    sub_rows = await conn.fetch(
-        f"SELECT artist, COUNT(*) AS track_count "
-        f"FROM tracks "
-        f"WHERE {' OR '.join(conds)} "
-        f"GROUP BY artist "
-        f"ORDER BY track_count DESC, artist "
-        f"LIMIT {int(limit)}",
-        *params
+    rows = await conn.fetch(
+        "SELECT artist, COUNT(*) AS track_count FROM tracks "
+        "WHERE artist IS NOT NULL AND artist <> '' "
+        "GROUP BY artist"
     )
-    return [{"artist": r["artist"], "track_count": r["track_count"], "exact": False}
-            for r in sub_rows]
+
+    exact_hits, sub_hits, token_hits = [], [], []
+    for r in rows:
+        artist = r['artist']
+        a_keys = _artist_keys(artist)
+        if not a_keys:
+            continue
+        if a_keys & q_keys:
+            exact_hits.append((artist, r['track_count']))
+            continue
+        matched = False
+        for ak in a_keys:
+            for qs in q_subs:
+                if qs and qs in ak:
+                    sub_hits.append((artist, r['track_count']))
+                    matched = True
+                    break
+            if matched:
+                break
+        if matched:
+            continue
+        if len(q_tokens) >= 2:
+            if all(any(tok in ak for ak in a_keys) for tok in q_tokens):
+                token_hits.append((artist, r['track_count']))
+
+    def _sort(hits):
+        hits.sort(key=lambda x: (-x[1], x[0].lower()))
+        return hits
+
+    if exact_hits:
+        return [{"artist": a, "track_count": c, "exact": True}
+                for a, c in _sort(exact_hits)[:limit]]
+    if sub_hits:
+        return [{"artist": a, "track_count": c, "exact": False}
+                for a, c in _sort(sub_hits)[:limit]]
+    if token_hits:
+        return [{"artist": a, "track_count": c, "exact": False}
+                for a, c in _sort(token_hits)[:limit]]
+    return []
 
 async def _resolve_artist(conn, query: str):
     """Возвращает каноничное имя артиста или None (лучший кандидат)."""
