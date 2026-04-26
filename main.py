@@ -755,7 +755,7 @@ async def spl(m: types.Message, state: FSMContext):
         count = len(res)
         rows = [
             [
-                InlineKeyboardButton(text=f"📋 {html.escape(p['name'])}", callback_data=f"opl_{p['id']}"),
+                InlineKeyboardButton(text=f"📋 {p['name']}", callback_data=f"opl_{p['id']}"),
                 InlineKeyboardButton(text="🗑", callback_data=f"delpl_{p['id']}")
             ]
             for p in res
@@ -847,7 +847,7 @@ async def cpl(c: types.CallbackQuery):
             await c.answer("Сначала создай плейлист", show_alert=True)
             return
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"📋 {html.escape(p['name'])}", callback_data=f"apl_{p['id']}_{tid}")]
+            [InlineKeyboardButton(text=f"📋 {p['name']}", callback_data=f"apl_{p['id']}_{tid}")]
             for p in pls
         ])
         await c.message.answer("Выбери:", reply_markup=kb)
@@ -1431,7 +1431,7 @@ def build_vote_keyboard(session_id: int, rows, closed=False) -> InlineKeyboardMa
     for i, r in enumerate(rows):
         pct = round(r['vote_count'] / total * 100) if total > 0 else 0
         prefix = medals[i] if i < 3 else f"{i + 1}."
-        name = html.escape(format_track(r['artist'], r['title']))[:30]
+        name = format_track(r['artist'], r['title'])[:30]
         label = f"{prefix} {name} — {r['vote_count']} ({pct}%)"
         buttons.append([InlineKeyboardButton(
             text=label,
