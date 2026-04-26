@@ -2417,10 +2417,18 @@ async def main():
     except Exception as e:
         logging.error(f"❌ Не удалось получить username бота: {e}")
 
-    await bot.delete_webhook(drop_pending_updates=True)
     full_url = webhook_url.rstrip("/") + WEBHOOK_PATH
-    await bot.set_webhook(url=full_url)
-    logging.info(f"✅ Webhook установлен: {full_url}")
+    try:
+        info = await bot.get_webhook_info()
+        current_url = (info.url or "").rstrip("/")
+    except Exception as e:
+        logging.warning(f"Не удалось получить webhook info: {e}")
+        current_url = ""
+    if current_url != full_url:
+        await bot.set_webhook(url=full_url, drop_pending_updates=False)
+        logging.info(f"✅ Webhook обновлён: {full_url}")
+    else:
+        logging.info(f"✅ Webhook уже актуален: {full_url} — апдейты не сбрасываем")
 
     asyncio.create_task(vote_auto_close_loop())
     logging.info("✅ Авто-закрытие голосований запущено")
@@ -2429,8 +2437,8 @@ async def main():
         while True:
             await asyncio.sleep(3600)
     except (KeyboardInterrupt, SystemExit):
-        logging.info("Остановка бота...")
-        await bot.delete_webhook()
+        logging.info("Остановка бота... webhook оставляем зарегистрированным, "
+                     "чтобы Telegram копил апдейты до следующего запуска")
         await runner.cleanup()
         if db_pool:
             await db_pool.close()
