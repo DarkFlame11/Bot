@@ -1470,11 +1470,7 @@ async def _start_vote(m: types.Message, vote_type: str, limit: int, hours: int =
                 await m.answer(f"⚠️ Голосование за {label} уже запущено")
             return
         if canonical_artist:
-            tracks = await conn.fetch(
-                "SELECT id, title, artist FROM tracks WHERE artist=$1 "
-                "ORDER BY plays DESC, id LIMIT $2",
-                canonical_artist, limit
-            )
+            tracks = await _fetch_vote_tracks(conn, cands[0], limit)
         else:
             tracks = await conn.fetch(
                 "SELECT id, title, artist FROM tracks ORDER BY plays DESC LIMIT $1", limit
@@ -1682,15 +1678,65 @@ async def _find_artist_candidates(conn, query: str, limit: int = 8):
         return hits
 
     if exact_hits:
-        return [{"artist": a, "track_count": c, "exact": True}
+        return [{"artist": a, "track_count": c, "exact": True, "match_field": "artist"}
                 for a, c in _sort(exact_hits)[:limit]]
     if sub_hits:
-        return [{"artist": a, "track_count": c, "exact": False}
+        return [{"artist": a, "track_count": c, "exact": False, "match_field": "artist"}
                 for a, c in _sort(sub_hits)[:limit]]
     if token_hits:
-        return [{"artist": a, "track_count": c, "exact": False}
+        return [{"artist": a, "track_count": c, "exact": False, "match_field": "artist"}
                 for a, c in _sort(token_hits)[:limit]]
+
+    # Fallback: ничего не нашли в колонке artist — ищем в title (как обычный поиск).
+    # Возвращаем синтетический кандидат с меткой запроса.
+    var = get_var(query)
+    if var:
+        where_parts = []
+        params = []
+        for v in var:
+            v_esc = _esc_like(v)
+            params.append('%' + v_esc + '%')
+            where_parts.append(f"title ILIKE ${len(params)}")
+        if where_parts:
+            where = ' OR '.join(where_parts)
+            cnt = await conn.fetchval(
+                f"SELECT COUNT(*) FROM tracks WHERE {where}", *params
+            )
+            if cnt and cnt > 0:
+                return [{
+                    "artist": query.strip(),
+                    "track_count": int(cnt),
+                    "exact": True,
+                    "match_field": "title",
+                }]
     return []
+
+async def _fetch_vote_tracks(conn, cand, limit: int):
+    """Достаёт треки для голосования по найденному кандидату-артисту.
+    Если совпадение было по колонке title — ищет по title (через ILIKE
+    со всеми вариантами транслита), иначе строго по artist=$1."""
+    if cand.get('match_field') == 'title':
+        var = get_var(cand['artist'])
+        where_parts = []
+        params = []
+        for v in var:
+            v_esc = _esc_like(v)
+            params.append('%' + v_esc + '%')
+            where_parts.append(f"title ILIKE ${len(params)}")
+        if not where_parts:
+            return []
+        where = ' OR '.join(where_parts)
+        params.append(limit)
+        return await conn.fetch(
+            f"SELECT id, title, artist FROM tracks WHERE {where} "
+            f"ORDER BY plays DESC, id LIMIT ${len(params)}",
+            *params
+        )
+    return await conn.fetch(
+        "SELECT id, title, artist FROM tracks WHERE artist=$1 "
+        "ORDER BY plays DESC, id LIMIT $2",
+        cand['artist'], limit
+    )
 
 async def _resolve_artist(conn, query: str):
     """Возвращает каноничное имя артиста или None (лучший кандидат)."""
@@ -1725,6 +1771,19 @@ async def find_artist_cmd(m: types.Message):
     ]
     if not cands:
         lines.append("❌ Совпадений не найдено")
+        async with db_pool.acquire() as conn:
+            sample = await conn.fetch(
+                "SELECT artist, COUNT(*) AS c FROM tracks "
+                "WHERE artist IS NOT NULL AND artist <> '' "
+                "GROUP BY artist ORDER BY c DESC, artist ASC LIMIT 20"
+            )
+        if sample:
+            lines.append("")
+            lines.append(f"📂 <b>Что есть в базе (до 20):</b>")
+            for r in sample:
+                lines.append(
+                    f"• <b>{html.escape(r['artist'])}</b> — {r['c']} тр."
+                )
     else:
         lines.append(f"✅ <b>Найдено ({len(cands)}):</b>")
         for i, c in enumerate(cands, 1):
@@ -1831,10 +1890,7 @@ async def start_artist(m: types.Message):
         if existing:
             await m.answer(f"⚠️ Голосование за {html.escape(canonical)} уже идёт")
             return
-        tracks = await conn.fetch(
-            "SELECT id, title, artist FROM tracks WHERE artist=$1 ORDER BY plays DESC, id LIMIT 10",
-            canonical
-        )
+        tracks = await _fetch_vote_tracks(conn, cands[0], 10)
         if len(tracks) < 2:
             await m.answer(f"❌ У {html.escape(canonical)} меньше 2 треков в базе")
             return
