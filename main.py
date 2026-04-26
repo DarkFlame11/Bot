@@ -359,16 +359,39 @@ def get_var(q):
         if cyr and cyr != q: v.append(cyr)
     return v
 
-def _search_conditions(var):
-    conditions, params, p = [], [], 1
-    for v in var:
-        conditions.append(f"title ILIKE ${p}")
-        params.append(f"%{v}%")
-        p += 1
-        conditions.append(f"artist ILIKE ${p}")
-        params.append(f"%{v}%")
-        p += 1
-    return conditions, params, p
+def _esc_like(s: str) -> str:
+    """Экранирует спецсимволы LIKE/ILIKE."""
+    return s.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+
+def _search_query_parts(variants):
+    """Собирает части SQL для поиска по треку/артисту с ранжированием.
+    Возвращает (where_expr, score_expr, params, next_param_index).
+    На каждый вариант запроса генерирует 3 параметра (exact, prefix, substring)
+    и оценивает релевантность: точное совпадение > префикс > подстрока,
+    название важнее исполнителя.
+    """
+    where = []
+    score_terms = []
+    params = []
+    p = 1
+    for v in variants:
+        v_esc = _esc_like(v)
+        params.extend([v_esc, v_esc + '%', '%' + v_esc + '%'])
+        i_exact, i_prefix, i_substr = p, p + 1, p + 2
+        p += 3
+        where.append(f"title ILIKE ${i_substr}")
+        where.append(f"artist ILIKE ${i_substr}")
+        score_terms.append(
+            f"(CASE WHEN title  ILIKE ${i_exact}  THEN 100 ELSE 0 END"
+            f" + CASE WHEN artist ILIKE ${i_exact}  THEN 80  ELSE 0 END"
+            f" + CASE WHEN title  ILIKE ${i_prefix} THEN 30  ELSE 0 END"
+            f" + CASE WHEN artist ILIKE ${i_prefix} THEN 25  ELSE 0 END"
+            f" + CASE WHEN title  ILIKE ${i_substr} THEN 5   ELSE 0 END"
+            f" + CASE WHEN artist ILIKE ${i_substr} THEN 4   ELSE 0 END)"
+        )
+    where_expr = ' OR '.join(where) if where else 'FALSE'
+    score_expr = ' + '.join(score_terms) if score_terms else '0'
+    return where_expr, score_expr, params, p
 
 async def run_search(query, offset=0):
     async with db_pool.acquire() as conn:
@@ -376,12 +399,13 @@ async def run_search(query, offset=0):
         if not var:
             return [], 0
         try:
-            conditions, params, p = _search_conditions(var)
+            where_expr, score_expr, params, p = _search_query_parts(var)
             sql = (
                 f"SELECT id, title, artist, COUNT(*) OVER() AS total "
-                f"FROM (SELECT DISTINCT id, title, artist FROM tracks "
-                f"WHERE {' OR '.join(conditions)}) sub "
-                f"ORDER BY id "
+                f"FROM (SELECT id, title, artist, plays, "
+                f"             ({score_expr}) AS score "
+                f"      FROM tracks WHERE {where_expr}) sub "
+                f"ORDER BY score DESC, plays DESC, id DESC "
                 f"LIMIT ${p} OFFSET ${p+1}"
             )
             params.extend([PAGE_SIZE, offset])
@@ -1266,8 +1290,14 @@ async def mg_cmd(m: types.Message):
                 if not var:
                     await m.answer("❌ Пустой запрос")
                     return
-                conditions, params, p = _search_conditions(var)
-                sql = f"SELECT id, title, artist FROM tracks WHERE {' OR '.join(conditions)} ORDER BY id DESC LIMIT 30"
+                where_expr, score_expr, params, _ = _search_query_parts(var)
+                sql = (
+                    f"SELECT id, title, artist FROM ("
+                    f"  SELECT id, title, artist, plays, ({score_expr}) AS score "
+                    f"  FROM tracks WHERE {where_expr}"
+                    f") sub "
+                    f"ORDER BY score DESC, plays DESC, id DESC LIMIT 30"
+                )
                 res = await conn.fetch(sql, *params)
                 header = f"🔍 По запросу «{html.escape(query)}»:"
             else:
@@ -1417,14 +1447,14 @@ async def _start_vote(m: types.Message, vote_type: str, limit: int, hours: int =
     canonical_artist = None
     async with db_pool.acquire() as conn:
         if artist:
-            canonical_artist = await conn.fetchval(
-                "SELECT artist FROM tracks WHERE artist ILIKE $1 "
-                "GROUP BY artist ORDER BY COUNT(*) DESC LIMIT 1",
-                artist
-            )
-            if not canonical_artist:
+            cands = await _find_artist_candidates(conn, artist, limit=8)
+            if not cands:
                 await m.answer(f"❌ Исполнитель «{html.escape(artist)}» не найден в базе")
                 return
+            if len(cands) > 1 and not cands[0]['exact']:
+                await m.answer(_format_artist_candidates(cands, artist), parse_mode="HTML")
+                return
+            canonical_artist = cands[0]['artist']
         period = f"{date_period}|{canonical_artist}" if canonical_artist else date_period
         existing = await conn.fetchval(
             "SELECT id FROM vote_sessions WHERE vote_type=$1 AND period=$2 AND status='active'",
@@ -1563,6 +1593,62 @@ async def debug_env(m: types.Message):
         parse_mode="HTML"
     )
 
+async def _find_artist_candidates(conn, query: str, limit: int = 8):
+    """Возвращает список словарей {artist, track_count, exact} по запросу.
+    Использует те же варианты транслитерации, что и обычный поиск треков
+    (кириллица ↔ латиница), плюс точное и подстрочное совпадение.
+    Сортировка: точные совпадения сверху, затем по числу треков."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    variants = list(dict.fromkeys(v for v in get_var(q) if v))
+    if not variants:
+        return []
+
+    placeholders = ",".join(f"${i+1}" for i in range(len(variants)))
+    exact_rows = await conn.fetch(
+        f"SELECT artist, COUNT(*) AS track_count "
+        f"FROM tracks "
+        f"WHERE LOWER(TRIM(artist)) = ANY(ARRAY[{placeholders}]::text[]) "
+        f"GROUP BY artist "
+        f"ORDER BY track_count DESC, artist "
+        f"LIMIT {int(limit)}",
+        *variants
+    )
+    if exact_rows:
+        return [{"artist": r["artist"], "track_count": r["track_count"], "exact": True}
+                for r in exact_rows]
+
+    conds, params, p = [], [], 1
+    for v in variants:
+        conds.append(f"artist ILIKE ${p}")
+        params.append(f"%{_esc_like(v)}%")
+        p += 1
+    sub_rows = await conn.fetch(
+        f"SELECT artist, COUNT(*) AS track_count "
+        f"FROM tracks "
+        f"WHERE {' OR '.join(conds)} "
+        f"GROUP BY artist "
+        f"ORDER BY track_count DESC, artist "
+        f"LIMIT {int(limit)}",
+        *params
+    )
+    return [{"artist": r["artist"], "track_count": r["track_count"], "exact": False}
+            for r in sub_rows]
+
+async def _resolve_artist(conn, query: str):
+    """Возвращает каноничное имя артиста или None (лучший кандидат)."""
+    cands = await _find_artist_candidates(conn, query, limit=1)
+    return cands[0]["artist"] if cands else None
+
+def _format_artist_candidates(cands, query: str) -> str:
+    """Форматирует список кандидатов для показа админу."""
+    lines = [f"❓ По запросу «{html.escape(query)}» нашлось несколько артистов:\n"]
+    for i, c in enumerate(cands, 1):
+        lines.append(f"{i}. <b>{html.escape(c['artist'])}</b> — {c['track_count']} тр.")
+    lines.append("\nУточни имя в команде.")
+    return "\n".join(lines)
+
 def _parse_hours(arg: str):
     """Парсит аргумент часов. Возвращает (hours, error_msg)."""
     stripped = arg.strip()
@@ -1637,14 +1723,14 @@ async def start_artist(m: types.Message):
         await m.answer("❌ CHANNEL_ID не задан в переменных окружения")
         return
     async with db_pool.acquire() as conn:
-        canonical = await conn.fetchval(
-            "SELECT artist FROM tracks WHERE artist ILIKE $1 "
-            "GROUP BY artist ORDER BY COUNT(*) DESC LIMIT 1",
-            artist_query
-        )
-        if not canonical:
+        cands = await _find_artist_candidates(conn, artist_query, limit=8)
+        if not cands:
             await m.answer(f"❌ Исполнитель «{html.escape(artist_query)}» не найден в базе")
             return
+        if len(cands) > 1 and not cands[0]['exact']:
+            await m.answer(_format_artist_candidates(cands, artist_query), parse_mode="HTML")
+            return
+        canonical = cands[0]['artist']
         existing = await conn.fetchval(
             "SELECT id FROM vote_sessions WHERE vote_type='artist' AND period=$1 AND status='active'",
             canonical
