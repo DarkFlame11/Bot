@@ -1596,6 +1596,7 @@ async def debug_env(m: types.Message):
     )
 
 _WS_RE = re.compile(r'\s+')
+_ALNUM_RE = re.compile(r'[^a-z0-9а-яё]+')
 
 def _normalize_str(s: str) -> str:
     """Нормализует строку для сравнения: убирает невидимые символы,
@@ -1609,20 +1610,27 @@ def _normalize_str(s: str) -> str:
     s = _WS_RE.sub(' ', s)
     return s
 
+def _alnum_only(s: str) -> str:
+    """Только буквы и цифры в нижнем регистре (всё остальное удаляется)."""
+    return _ALNUM_RE.sub('', _normalize_str(s))
+
 def _artist_keys(name: str) -> set:
     """Множество ключей для сравнения имени артиста: нормализованные
-    варианты + версии без пробелов + транслитерации (кириллица↔латиница)."""
+    варианты + версии без пробелов + только буквы/цифры + translit."""
     keys = set()
     n = _normalize_str(name)
     if not n:
         return keys
     keys.add(n)
     keys.add(n.replace(' ', ''))
+    keys.add(_alnum_only(n))
     for v in get_var(n):
         nv = _normalize_str(v)
         if nv:
             keys.add(nv)
             keys.add(nv.replace(' ', ''))
+            keys.add(_alnum_only(nv))
+    keys.discard('')
     return keys
 
 async def _find_artist_candidates(conn, query: str, limit: int = 8):
@@ -1688,6 +1696,43 @@ async def _resolve_artist(conn, query: str):
     """Возвращает каноничное имя артиста или None (лучший кандидат)."""
     cands = await _find_artist_candidates(conn, query, limit=1)
     return cands[0]["artist"] if cands else None
+
+@dp.message(Command("findartist"))
+async def find_artist_cmd(m: types.Message):
+    """Диагностика поиска артиста. Показывает, кого находит бот по запросу."""
+    if m.from_user.id != ADMIN_ID:
+        return
+    args = m.text.split(maxsplit=1)
+    query = args[1].strip() if len(args) > 1 else ""
+    if not query:
+        await m.answer(
+            "Использование: <code>/findartist &lt;запрос&gt;</code>",
+            parse_mode="HTML"
+        )
+        return
+    async with db_pool.acquire() as conn:
+        total_artists = await conn.fetchval(
+            "SELECT COUNT(DISTINCT artist) FROM tracks "
+            "WHERE artist IS NOT NULL AND artist <> ''"
+        )
+        cands = await _find_artist_candidates(conn, query, limit=10)
+    keys = sorted(_artist_keys(query))
+    lines = [
+        f"🔍 <b>Запрос:</b> <code>{html.escape(query)}</code>",
+        f"📚 <b>Артистов в базе:</b> {total_artists}",
+        f"🔑 <b>Ключи поиска ({len(keys)}):</b> <code>{html.escape(', '.join(keys))}</code>",
+        "",
+    ]
+    if not cands:
+        lines.append("❌ Совпадений не найдено")
+    else:
+        lines.append(f"✅ <b>Найдено ({len(cands)}):</b>")
+        for i, c in enumerate(cands, 1):
+            mark = "★" if c['exact'] else "·"
+            lines.append(
+                f"{i}. {mark} <b>{html.escape(c['artist'])}</b> — {c['track_count']} тр."
+            )
+    await m.answer("\n".join(lines), parse_mode="HTML")
 
 def _format_artist_candidates(cands, query: str) -> str:
     """Форматирует список кандидатов для показа админу."""
