@@ -622,11 +622,9 @@ async def start_cmd(m: types.Message, state: FSMContext):
             return
     await m.answer("🎧 Бот запущен", reply_markup=menu)
 
-@dp.message(RequestForm.waiting_text, F.text)
+@dp.message(RequestForm.waiting_text, F.text & ~F.text.startswith("/"))
 async def request_text_handler(m: types.Message, state: FSMContext):
     text = (m.text or "").strip()
-    if text.startswith("/"):
-        return
     if not text:
         await m.answer("❌ Пусто. Напиши название трека или /cancel")
         return
