@@ -212,6 +212,43 @@ async def init_db():
                 last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS request_sessions (
+                id SERIAL PRIMARY KEY,
+                channel_chat_id BIGINT,
+                channel_message_id BIGINT,
+                discussion_chat_id BIGINT,
+                discussion_thread_id BIGINT,
+                title TEXT,
+                status TEXT DEFAULT 'active',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS track_requests (
+                id SERIAL PRIMARY KEY,
+                session_id INTEGER NOT NULL,
+                user_id BIGINT,
+                username TEXT,
+                full_name TEXT,
+                text TEXT NOT NULL,
+                discussion_message_id BIGINT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(session_id) REFERENCES request_sessions(id) ON DELETE CASCADE
+            )
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_req_sessions_active "
+            "ON request_sessions (status, created_at DESC)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_req_sessions_thread "
+            "ON request_sessions (discussion_chat_id, discussion_thread_id)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_track_requests_session "
+            "ON track_requests (session_id, created_at DESC)"
+        )
         await conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tracks_title_trgm ON tracks USING GIN (title gin_trgm_ops)"
@@ -260,6 +297,11 @@ class BroadcastForm(StatesGroup):
 
 class DonateForm(StatesGroup):
     waiting_amount = State()
+
+class RequestForm(StatesGroup):
+    waiting_text = State()
+
+BOT_USERNAME = ""
 
 # --- КОНСТАНТЫ ---
 PAGE_SIZE = 10
@@ -551,7 +593,76 @@ async def show_playlist_page(pid: int, user_id: int, page: int, target, edit: bo
 @dp.message(Command("start"))
 async def start_cmd(m: types.Message, state: FSMContext):
     await state.clear()
+    parts = m.text.split(maxsplit=1)
+    payload = parts[1].strip() if len(parts) > 1 else ""
+    if payload.startswith("req_"):
+        try:
+            sid = int(payload[4:])
+        except ValueError:
+            sid = None
+        if sid:
+            async with db_pool.acquire() as conn:
+                session = await conn.fetchrow(
+                    "SELECT id, status FROM request_sessions WHERE id=$1", sid
+                )
+            if not session or session['status'] != 'active':
+                await m.answer(
+                    "❌ Сбор заявок уже закрыт. Следи за каналом — будет новый пост.",
+                    reply_markup=menu
+                )
+                return
+            await state.set_state(RequestForm.waiting_text)
+            await state.update_data(session_id=sid)
+            await m.answer(
+                "📝 Напиши <b>одним сообщением</b> исполнителя и название трека, "
+                "который хочешь следующим.\n\nНапример: <code>Eminem — Mockingbird</code>\n\n"
+                "Отменить — /cancel",
+                parse_mode="HTML"
+            )
+            return
     await m.answer("🎧 Бот запущен", reply_markup=menu)
+
+@dp.message(RequestForm.waiting_text, F.text)
+async def request_text_handler(m: types.Message, state: FSMContext):
+    text = (m.text or "").strip()
+    if text.startswith("/"):
+        return
+    if not text:
+        await m.answer("❌ Пусто. Напиши название трека или /cancel")
+        return
+    if len(text) > 500:
+        text = text[:500]
+    data = await state.get_data()
+    sid = data.get("session_id")
+    if not sid:
+        await state.clear()
+        await m.answer("❌ Сессия потеряна. Попробуй снова через пост в канале.")
+        return
+    async with db_pool.acquire() as conn:
+        session = await conn.fetchrow(
+            "SELECT id, status FROM request_sessions WHERE id=$1", sid
+        )
+        if not session or session['status'] != 'active':
+            await state.clear()
+            await m.answer("❌ Сбор заявок уже закрыт.")
+            return
+        err_code, err_text = await _request_limit_status(conn, sid, m.from_user.id)
+        if err_code:
+            await state.clear()
+            await m.answer(err_text, reply_markup=menu)
+            return
+        await conn.execute(
+            "INSERT INTO track_requests "
+            "(session_id, user_id, username, full_name, text) "
+            "VALUES ($1, $2, $3, $4, $5)",
+            sid,
+            m.from_user.id,
+            m.from_user.username,
+            m.from_user.full_name,
+            text
+        )
+    await state.clear()
+    await m.answer("✅ Заявка принята, спасибо!", reply_markup=menu)
 
 @dp.channel_post(F.audio)
 async def save_track(m: types.Message):
@@ -1225,10 +1336,10 @@ def build_search_keyboard(query: str, offset: int, total: int) -> InlineKeyboard
     rows.append([InlineKeyboardButton(text=f"Страница {current_page} из {total_pages}", callback_data="noop")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-@dp.message(F.text & ~F.text.startswith("/") & ~F.text.in_({"🔍 Поиск","🎲 Случайный","🔥 Топ","🆕 Новое","❤️ Избранное","📋 Список Плейлистов","💝 Донат"}))
+@dp.message(F.chat.type == "private", F.text & ~F.text.startswith("/") & ~F.text.in_({"🔍 Поиск","🎲 Случайный","🔥 Топ","🆕 Новое","❤️ Избранное","📋 Список Плейлистов","💝 Донат"}))
 async def search(m: types.Message, state: FSMContext):
     cur = await state.get_state()
-    if cur in (PlaylistForm.waiting_name, BroadcastForm.waiting_text, DonateForm.waiting_amount):
+    if cur in (PlaylistForm.waiting_name, BroadcastForm.waiting_text, DonateForm.waiting_amount, RequestForm.waiting_text):
         return
     q = m.text.strip()
     if not q: return
@@ -2029,6 +2140,236 @@ async def handle_vote(c: types.CallbackQuery):
         logging.error(f"Ошибка в handle_vote: {e}")
         await c.answer("❌ Ошибка", show_alert=True)
 
+# --- ЗАЯВКИ НА ТРЕКИ (ПОСТ + КОММЕНТАРИИ В ОБСУЖДАЛКЕ) ---
+
+REQUEST_DEFAULT_TEXT = (
+    "🎵 <b>Какую песню хотите следующей?</b>\n\n"
+    "Нажмите кнопку ниже и напишите боту в личку: исполнитель — название."
+)
+MAX_REQUESTS_PER_USER = 3
+MAX_REQUESTS_PER_SESSION = 500
+
+async def _request_limit_status(conn, session_id: int, user_id: int):
+    """Проверка лимитов заявок. Возвращает (None, None) если можно,
+    иначе (код_ошибки, текст_для_пользователя)."""
+    total = await conn.fetchval(
+        "SELECT COUNT(*) FROM track_requests WHERE session_id=$1", session_id
+    )
+    if total and total >= MAX_REQUESTS_PER_SESSION:
+        return ("session_full",
+                "❌ Лимит заявок в этой сессии исчерпан. Жди следующего поста.")
+    if user_id:
+        from_user = await conn.fetchval(
+            "SELECT COUNT(*) FROM track_requests "
+            "WHERE session_id=$1 AND user_id=$2",
+            session_id, user_id
+        )
+        if from_user and from_user >= MAX_REQUESTS_PER_USER:
+            return ("user_limit",
+                    f"❌ Ты уже отправил {MAX_REQUESTS_PER_USER} "
+                    f"{'заявку' if MAX_REQUESTS_PER_USER == 1 else 'заявки'} "
+                    f"в этой сессии — это максимум.")
+    return (None, None)
+
+@dp.message(Command("askreq"))
+async def ask_requests_cmd(m: types.Message):
+    """Опубликовать в канале пост-приглашение для заявок.
+    Использование: /askreq [текст поста]. Без аргумента — текст по умолчанию."""
+    if m.from_user.id != ADMIN_ID:
+        return
+    channel_id = get_channel_id()
+    if not channel_id:
+        await m.answer("❌ CHANNEL_ID не задан в переменных окружения")
+        return
+    args = m.text.split(maxsplit=1)
+    custom_text = args[1].strip() if len(args) > 1 else ""
+    post_text = custom_text if custom_text else REQUEST_DEFAULT_TEXT
+    if not BOT_USERNAME:
+        await m.answer("❌ Имя бота ещё не определено, попробуй через пару секунд")
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE request_sessions SET status='closed' WHERE status='active'"
+        )
+        session_id = await conn.fetchval(
+            "INSERT INTO request_sessions "
+            "(channel_chat_id, channel_message_id, title) "
+            "VALUES (NULL, NULL, $1) RETURNING id",
+            (custom_text[:100] if custom_text else "Заявки на трек")
+        )
+    deep_link = f"https://t.me/{BOT_USERNAME}?start=req_{session_id}"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Подать заявку", url=deep_link)]
+    ])
+    try:
+        sent = await bot.send_message(
+            channel_id, post_text, parse_mode="HTML", reply_markup=kb
+        )
+    except Exception as e:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM request_sessions WHERE id=$1", session_id
+            )
+        await m.answer(f"❌ Не удалось отправить пост в канал: {html.escape(str(e))}")
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE request_sessions SET channel_chat_id=$1, channel_message_id=$2 "
+            "WHERE id=$3",
+            sent.chat.id, sent.message_id, session_id
+        )
+    await m.answer(
+        f"✅ Пост опубликован (сессия #{session_id}).\n"
+        f"Заявки идут двумя путями:\n"
+        f"• кнопка «Подать заявку» под постом → личка с ботом;\n"
+        f"• комментарии под постом (если у канала есть обсуждалка).\n\n"
+        f"Собрать список — /requests",
+        parse_mode="HTML"
+    )
+
+@dp.message(F.is_automatic_forward, F.forward_from_chat)
+async def request_thread_anchor(m: types.Message):
+    """Авто-форвард поста из канала в обсуждалку. Привязываем
+    активную сессию к этому треду, чтобы потом ловить комментарии."""
+    if m.forward_from_chat.type != "channel":
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE request_sessions SET discussion_chat_id=$1, "
+            "discussion_thread_id=$2 "
+            "WHERE channel_chat_id=$3 AND channel_message_id=$4 "
+            "AND status='active'",
+            m.chat.id, m.message_id,
+            m.forward_from_chat.id, m.forward_from_message_id
+        )
+
+@dp.message(F.chat.type.in_({"group", "supergroup"}), F.message_thread_id)
+async def request_comment_handler(m: types.Message):
+    """Комментарии под постом-приглашением (в связанной обсуждалке)."""
+    if m.from_user and m.from_user.is_bot:
+        return
+    text = (m.text or m.caption or "").strip()
+    if not text:
+        return
+    async with db_pool.acquire() as conn:
+        session = await conn.fetchrow(
+            "SELECT id FROM request_sessions "
+            "WHERE discussion_chat_id=$1 AND discussion_thread_id=$2 "
+            "AND status='active'",
+            m.chat.id, m.message_thread_id
+        )
+        if not session:
+            return
+        uid = m.from_user.id if m.from_user else None
+        err_code, _ = await _request_limit_status(conn, session['id'], uid)
+        if err_code:
+            return
+        await conn.execute(
+            "INSERT INTO track_requests "
+            "(session_id, user_id, username, full_name, text, discussion_message_id) "
+            "VALUES ($1, $2, $3, $4, $5, $6)",
+            session['id'],
+            uid,
+            m.from_user.username if m.from_user else None,
+            m.from_user.full_name if m.from_user else None,
+            text[:500],
+            m.message_id
+        )
+
+def _format_user_label(username: str, full_name: str, user_id: int) -> str:
+    if username:
+        return f"@{username}"
+    if full_name:
+        return full_name
+    return f"id{user_id}" if user_id else "anon"
+
+@dp.message(Command("requests"))
+async def list_requests_cmd(m: types.Message):
+    """Показать список заявок последней активной сессии."""
+    if m.from_user.id != ADMIN_ID:
+        return
+    async with db_pool.acquire() as conn:
+        session = await conn.fetchrow(
+            "SELECT id, status, discussion_thread_id, created_at "
+            "FROM request_sessions ORDER BY created_at DESC LIMIT 1"
+        )
+        if not session:
+            await m.answer(
+                "❌ Сессий заявок нет. Запусти: <code>/askreq</code>",
+                parse_mode="HTML"
+            )
+            return
+        rows = await conn.fetch(
+            "SELECT id, user_id, username, full_name, text, created_at "
+            "FROM track_requests WHERE session_id=$1 "
+            "ORDER BY created_at ASC",
+            session['id']
+        )
+    status_label = "активна" if session['status'] == 'active' else "закрыта"
+    thread_warn = ""
+    if session['status'] == 'active' and not session['discussion_thread_id']:
+        thread_warn = (
+            "\n⚠️ Бот пока не получил авто-форвард поста в обсуждалку. "
+            "Убедись, что бот добавлен в обсуждалку канала."
+        )
+    if not rows:
+        await m.answer(
+            f"📭 Сессия #{session['id']} ({status_label}) — заявок пока нет.{thread_warn}",
+            parse_mode="HTML"
+        )
+        return
+    lines = [
+        f"📥 <b>Заявки сессии #{session['id']}</b> ({status_label}, всего {len(rows)}):"
+    ]
+    for r in rows:
+        who = _format_user_label(r['username'], r['full_name'], r['user_id'])
+        lines.append(
+            f"{r['id']}. <b>{html.escape(who)}</b>: {html.escape(r['text'])}"
+        )
+    if thread_warn:
+        lines.append(thread_warn)
+    text = "\n".join(lines)
+    for chunk_start in range(0, len(text), 3500):
+        await m.answer(text[chunk_start:chunk_start + 3500], parse_mode="HTML")
+
+@dp.message(Command("closereq"))
+async def close_requests_cmd(m: types.Message):
+    """Закрыть текущую активную сессию заявок."""
+    if m.from_user.id != ADMIN_ID:
+        return
+    async with db_pool.acquire() as conn:
+        session = await conn.fetchrow(
+            "SELECT id FROM request_sessions WHERE status='active' "
+            "ORDER BY created_at DESC LIMIT 1"
+        )
+        if not session:
+            await m.answer("❌ Активных сессий заявок нет")
+            return
+        await conn.execute(
+            "UPDATE request_sessions SET status='closed' WHERE id=$1",
+            session['id']
+        )
+    await m.answer(f"✅ Сессия #{session['id']} закрыта. Новые комментарии не учитываются.")
+
+@dp.message(Command("clearreq"))
+async def clear_requests_cmd(m: types.Message):
+    """Удалить все заявки последней сессии."""
+    if m.from_user.id != ADMIN_ID:
+        return
+    async with db_pool.acquire() as conn:
+        session = await conn.fetchrow(
+            "SELECT id FROM request_sessions ORDER BY created_at DESC LIMIT 1"
+        )
+        if not session:
+            await m.answer("❌ Сессий заявок нет")
+            return
+        deleted = await conn.fetchval(
+            "WITH d AS (DELETE FROM track_requests WHERE session_id=$1 RETURNING 1) "
+            "SELECT COUNT(*) FROM d",
+            session['id']
+        )
+    await m.answer(f"🧹 Удалено заявок: {deleted} (сессия #{session['id']})")
+
 # --- HEALTH CHECK ---
 WEBHOOK_PATH = "/webhook"
 
@@ -2069,6 +2410,14 @@ async def main():
 
     await init_db_pool()
     await init_db()
+
+    global BOT_USERNAME
+    try:
+        me = await bot.get_me()
+        BOT_USERNAME = me.username or ""
+        logging.info(f"✅ Bot username: @{BOT_USERNAME}")
+    except Exception as e:
+        logging.error(f"❌ Не удалось получить username бота: {e}")
 
     await bot.delete_webhook(drop_pending_updates=True)
     full_url = webhook_url.rstrip("/") + WEBHOOK_PATH
