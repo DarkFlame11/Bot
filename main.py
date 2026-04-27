@@ -94,6 +94,135 @@ class RegisterUserMiddleware(BaseMiddleware):
             await register_user(user)
         return await handler(event, data)
 
+# --- ГЕЙТ ПОДПИСКИ НА КАНАЛ ---
+SUB_CACHE: dict[int, tuple[bool, float]] = {}
+SUB_CACHE_TTL_OK = 600.0
+SUB_CACHE_TTL_FAIL = 30.0
+CHANNEL_INFO_CACHE: dict = {"url": None, "title": None, "fetched_at": 0.0}
+CHANNEL_INFO_TTL = 3600.0
+SUB_GATE_BYPASS_CALLBACKS = {"check_sub"}
+
+async def get_channel_info() -> tuple[str | None, str | None]:
+    """Возвращает (url, title) канала. Кеширует на час."""
+    now = asyncio.get_event_loop().time()
+    if (CHANNEL_INFO_CACHE["url"] or CHANNEL_INFO_CACHE["title"]) and \
+            now - CHANNEL_INFO_CACHE["fetched_at"] < CHANNEL_INFO_TTL:
+        return CHANNEL_INFO_CACHE["url"], CHANNEL_INFO_CACHE["title"]
+    cid = get_channel_id()
+    if not cid:
+        return None, None
+    url = None
+    title = None
+    try:
+        chat = await bot.get_chat(cid)
+        title = chat.title or None
+        if chat.username:
+            url = f"https://t.me/{chat.username}"
+        else:
+            url = chat.invite_link
+            if not url:
+                try:
+                    url = await bot.export_chat_invite_link(cid)
+                except Exception as e:
+                    logging.warning(f"Не удалось создать invite-ссылку канала: {e}")
+    except Exception as e:
+        logging.warning(f"Не удалось получить инфо канала: {e}")
+    CHANNEL_INFO_CACHE["url"] = url
+    CHANNEL_INFO_CACHE["title"] = title
+    CHANNEL_INFO_CACHE["fetched_at"] = now
+    return url, title
+
+async def is_subscribed(user_id: int) -> bool:
+    """Проверка подписки на CHANNEL_ID с кешем.
+    Админ — всегда True. Если CHANNEL_ID не задан — гейт выключен (True).
+    На ошибки Telegram отвечаем fail-open, чтобы не запереть всех при сбое API."""
+    if user_id == ADMIN_ID:
+        return True
+    cid = get_channel_id()
+    if not cid:
+        return True
+    now = asyncio.get_event_loop().time()
+    cached = SUB_CACHE.get(user_id)
+    if cached:
+        ok, ts = cached
+        ttl = SUB_CACHE_TTL_OK if ok else SUB_CACHE_TTL_FAIL
+        if now - ts < ttl:
+            return ok
+    try:
+        member = await bot.get_chat_member(cid, user_id)
+        status = getattr(member, "status", None)
+        if status in ("creator", "administrator", "member"):
+            ok = True
+        elif status == "restricted":
+            ok = bool(getattr(member, "is_member", False))
+        else:
+            ok = False
+    except Exception as e:
+        logging.warning(f"Не удалось проверить подписку user={user_id}: {e}")
+        return True
+    SUB_CACHE[user_id] = (ok, now)
+    return ok
+
+def _build_sub_gate_kb(channel_url: str | None) -> InlineKeyboardMarkup:
+    rows = []
+    if channel_url:
+        rows.append([InlineKeyboardButton(text="📢 Открыть канал", url=channel_url)])
+    rows.append([InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+async def send_sub_gate(event):
+    url, title = await get_channel_info()
+    title_html = html.escape(title) if title else "наш канал"
+    text = (
+        f"🔒 Доступ к боту только для подписчиков канала <b>{title_html}</b>.\n\n"
+        f"Подпишись и нажми «Я подписался» — и сразу продолжим."
+    )
+    kb = _build_sub_gate_kb(url)
+    if isinstance(event, types.CallbackQuery):
+        try:
+            await event.answer()
+        except Exception:
+            pass
+        msg = event.message
+        if msg:
+            try:
+                await msg.answer(text, parse_mode="HTML", reply_markup=kb)
+                return
+            except Exception:
+                pass
+    if isinstance(event, types.Message):
+        try:
+            await event.answer(text, parse_mode="HTML", reply_markup=kb)
+        except Exception as e:
+            logging.warning(f"Не удалось отправить sub-gate: {e}")
+
+class SubscriptionMiddleware(BaseMiddleware):
+    """Пускает в личку с ботом только подписчиков канала.
+    Админа, ботов, а также апдейты из групп/каналов/обсуждалок пропускает без проверки."""
+    async def __call__(self, handler, event, data):
+        user = getattr(event, 'from_user', None)
+        if not user or user.is_bot or user.id == ADMIN_ID:
+            return await handler(event, data)
+        # Определяем чат события
+        chat = None
+        if isinstance(event, types.Message):
+            chat = event.chat
+        elif isinstance(event, types.CallbackQuery) and event.message:
+            chat = event.message.chat
+        # Гейтим только личку с ботом — комментарии в обсуждалке и события каналов пропускаем
+        if chat is not None and chat.type != "private":
+            return await handler(event, data)
+        # Кнопка "Я подписался" должна доходить до своего обработчика
+        if isinstance(event, types.CallbackQuery) and event.data in SUB_GATE_BYPASS_CALLBACKS:
+            return await handler(event, data)
+        # PreCheckoutQuery и прочие апдейты без явного chat — не гейтим
+        if chat is None and not isinstance(event, types.Message):
+            return await handler(event, data)
+        if await is_subscribed(user.id):
+            return await handler(event, data)
+        await send_sub_gate(event)
+        return None
+
 class ThrottleMiddleware(BaseMiddleware):
     """Антиспам: ограничивает частоту действий пользователя.
     По умолчанию: не больше RATE_LIMIT_HITS событий за RATE_LIMIT_WINDOW секунд."""
@@ -589,6 +718,37 @@ async def show_playlist_page(pid: int, user_id: int, page: int, target, edit: bo
         await target.message.answer(h, reply_markup=kb, parse_mode="HTML")
 
 # --- ХЭНДЛЕРЫ ---
+
+@dp.callback_query(F.data == "check_sub")
+async def check_sub_cb(cb: types.CallbackQuery):
+    """Кнопка «Я подписался» — повторная проверка подписки."""
+    SUB_CACHE.pop(cb.from_user.id, None)
+    if await is_subscribed(cb.from_user.id):
+        try:
+            await cb.answer("✅ Подписка подтверждена!", show_alert=False)
+        except Exception:
+            pass
+        try:
+            if cb.message:
+                await cb.message.edit_text(
+                    "✅ Подписка подтверждена. Жми /start, чтобы начать пользоваться ботом."
+                )
+        except Exception:
+            try:
+                if cb.message:
+                    await cb.message.answer(
+                        "✅ Подписка подтверждена. Жми /start, чтобы начать."
+                    )
+            except Exception:
+                pass
+    else:
+        try:
+            await cb.answer(
+                "❌ Подписка не найдена. Подпишись на канал и нажми кнопку ещё раз.",
+                show_alert=True
+            )
+        except Exception:
+            pass
 
 @dp.message(Command("start"))
 async def start_cmd(m: types.Message, state: FSMContext):
@@ -2381,6 +2541,8 @@ async def main():
     dp.callback_query.middleware(ThrottleMiddleware())
     dp.message.middleware(RegisterUserMiddleware())
     dp.callback_query.middleware(RegisterUserMiddleware())
+    dp.message.middleware(SubscriptionMiddleware())
+    dp.callback_query.middleware(SubscriptionMiddleware())
 
     webhook_url = os.environ.get("WEBHOOK_URL", "")
     if not webhook_url:
