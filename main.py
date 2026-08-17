@@ -96,7 +96,9 @@ class RegisterUserMiddleware(BaseMiddleware):
 
 # --- ГЕЙТ ПОДПИСКИ НА КАНАЛ ---
 SUB_CACHE: dict[int, tuple[bool, float]] = {}
-SUB_CACHE_TTL_OK = 600.0
+# Положительный результат не кешируем: после выхода из канала доступ
+# должен закрываться при следующем действии пользователя.
+SUB_CACHE_TTL_OK = 0.0
 SUB_CACHE_TTL_FAIL = 30.0
 CHANNEL_INFO_CACHE: dict = {"url": None, "title": None, "fetched_at": 0.0}
 CHANNEL_INFO_TTL = 3600.0
@@ -133,20 +135,19 @@ async def get_channel_info() -> tuple[str | None, str | None]:
     return url, title
 
 async def is_subscribed(user_id: int) -> bool:
-    """Проверка подписки на CHANNEL_ID с кешем.
-    Админ — всегда True. Если CHANNEL_ID не задан — гейт выключен (True).
-    На ошибки Telegram отвечаем fail-open, чтобы не запереть всех при сбое API."""
+    """Проверка подписки на CHANNEL_ID без кеша успешного результата."""
     if user_id == ADMIN_ID:
         return True
     cid = get_channel_id()
     if not cid:
-        return True
+        logging.error("Проверка подписки невозможна: CHANNEL_ID не задан или некорректен")
+        return False
     now = asyncio.get_event_loop().time()
     cached = SUB_CACHE.get(user_id)
     if cached:
         ok, ts = cached
         ttl = SUB_CACHE_TTL_OK if ok else SUB_CACHE_TTL_FAIL
-        if now - ts < ttl:
+        if ttl > 0 and now - ts < ttl:
             return ok
     try:
         member = await bot.get_chat_member(cid, user_id)
@@ -159,8 +160,13 @@ async def is_subscribed(user_id: int) -> bool:
             ok = False
     except Exception as e:
         logging.warning(f"Не удалось проверить подписку user={user_id}: {e}")
-        return True
-    SUB_CACHE[user_id] = (ok, now)
+        # Не пропускаем пользователя при недоступном/неверно настроенном канале.
+        # Иначе проверка подписки фактически отключается.
+        return False
+    if ok:
+        SUB_CACHE.pop(user_id, None)
+    else:
+        SUB_CACHE[user_id] = (ok, now)
     return ok
 
 def _build_sub_gate_kb(channel_url: str | None) -> InlineKeyboardMarkup:
@@ -222,6 +228,46 @@ class SubscriptionMiddleware(BaseMiddleware):
             return await handler(event, data)
         await send_sub_gate(event)
         return None
+
+CHANNEL_MEMBER_STATUSES = {"creator", "administrator", "member", "restricted"}
+
+@dp.chat_member()
+async def channel_member_update(update: types.ChatMemberUpdated):
+    """Блокирует пользователя в канале, если он вышел из него."""
+    channel_id = get_channel_id()
+    if not channel_id or update.chat.id != channel_id:
+        return
+
+    old_status = getattr(update.old_chat_member, "status", "")
+    new_status = getattr(update.new_chat_member, "status", "")
+    user = update.new_chat_member.user
+    was_member = (
+        old_status in CHANNEL_MEMBER_STATUSES
+        or (
+            old_status == "restricted"
+            and bool(getattr(update.old_chat_member, "is_member", False))
+        )
+    )
+    left_channel = new_status in {"left", "kicked"}
+
+    if not was_member or not left_channel or user.id == ADMIN_ID:
+        return
+
+    SUB_CACHE.pop(user.id, None)
+    try:
+        await bot.ban_chat_member(chat_id=channel_id, user_id=user.id)
+        logging.info(
+            "Пользователь %s автоматически заблокирован после выхода из канала %s",
+            user.id,
+            channel_id,
+        )
+    except Exception as e:
+        logging.error(
+            "Не удалось автоматически заблокировать user=%s в channel=%s: %s",
+            user.id,
+            channel_id,
+            e,
+        )
 
 class ThrottleMiddleware(BaseMiddleware):
     """Антиспам: ограничивает частоту действий пользователя.
@@ -378,6 +424,29 @@ async def init_db():
             "CREATE INDEX IF NOT EXISTS idx_track_requests_session "
             "ON track_requests (session_id, created_at DESC)"
         )
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS star_orders (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                username TEXT,
+                full_name TEXT,
+                amount_stars INTEGER NOT NULL,
+                price_total NUMERIC(12,2) NOT NULL,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_star_orders_status "
+            "ON star_orders (status, created_at DESC)"
+        )
         await conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tracks_title_trgm ON tracks USING GIN (title gin_trgm_ops)"
@@ -429,6 +498,9 @@ class DonateForm(StatesGroup):
 
 class RequestForm(StatesGroup):
     waiting_text = State()
+
+class BuyStarsForm(StatesGroup):
+    waiting_amount = State()
 
 BOT_USERNAME = ""
 
@@ -1309,7 +1381,7 @@ async def donate_start(m: types.Message, state: FSMContext):
         "Спасибо, что хочешь помочь! 🙏\n"
         f"Введи сумму в Telegram Stars ⭐️ (от {DONATE_MIN} до {DONATE_MAX}).\n\n"
         "Для отмены: /cancel",
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
 
 @dp.message(DonateForm.waiting_amount)
@@ -1494,10 +1566,10 @@ def build_search_keyboard(query: str, offset: int, total: int) -> InlineKeyboard
     rows.append([InlineKeyboardButton(text=f"Страница {current_page} из {total_pages}", callback_data="noop")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-@dp.message(F.chat.type == "private", F.text & ~F.text.startswith("/") & ~F.text.in_({"🔍 Поиск","🎲 Случайный","🔥 Топ","🆕 Новое","❤️ Избранное","📋 Список Плейлистов","💝 Донат"}))
+@dp.message(F.chat.type == "private", F.text & ~F.text.startswith("/") & ~F.text.in_({"🔍 Поиск","🎲 Случайный","🔥 Топ","🆕 Новое","❤️ Избранное","📋 Список Плейлистов","💝 Донат","⭐️ Купить Stars"}))
 async def search(m: types.Message, state: FSMContext):
     cur = await state.get_state()
-    if cur in (PlaylistForm.waiting_name, BroadcastForm.waiting_text, DonateForm.waiting_amount, RequestForm.waiting_text):
+    if cur in (PlaylistForm.waiting_name, BroadcastForm.waiting_text, DonateForm.waiting_amount, RequestForm.waiting_text, BuyStarsForm.waiting_amount):
         return
     q = m.text.strip()
     if not q: return
@@ -1859,6 +1931,41 @@ async def debug_env(m: types.Message):
         f"После парсинга: <code>{parsed}</code>",
         parse_mode="HTML"
     )
+
+@dp.message(Command("checkchannel"))
+async def check_channel_cmd(m: types.Message):
+    """Проверка доступности канала и прав бота."""
+    if m.from_user.id != ADMIN_ID:
+        return
+    channel_id = get_channel_id()
+    if not channel_id:
+        await m.answer("❌ CHANNEL_ID не задан или имеет некорректный формат.")
+        return
+    try:
+        chat = await bot.get_chat(channel_id)
+        me = await bot.get_me()
+        member = await bot.get_chat_member(channel_id, me.id)
+        status = getattr(member, "status", "unknown")
+        can_restrict = getattr(member, "can_restrict_members", None)
+        if status == "creator":
+            rights = "создатель канала"
+        elif status == "administrator" and can_restrict:
+            rights = "администратор, блокировка участников разрешена"
+        elif status == "administrator":
+            rights = "администратор, но права блокировки нет"
+        else:
+            rights = f"статус {status}, прав администратора недостаточно"
+        await m.answer(
+            f"✅ Канал найден: <b>{html.escape(chat.title or 'без названия')}</b>\n"
+            f"🤖 Права бота: <b>{html.escape(rights)}</b>",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logging.error("Проверка канала не пройдена: %s", e)
+        await m.answer(
+            "❌ Бот не видит канал по текущему CHANNEL_ID.\n"
+            "Добавь этого бота в нужный канал администратором и проверь CHANNEL_ID."
+        )
 
 _WS_RE = re.compile(r'\s+')
 _ALNUM_RE = re.compile(r'[^a-z0-9а-яё]+')
@@ -2298,6 +2405,385 @@ async def handle_vote(c: types.CallbackQuery):
         logging.error(f"Ошибка в handle_vote: {e}")
         await c.answer("❌ Ошибка", show_alert=True)
 
+# --- ПРОДАЖА STARS ---
+
+async def _get_setting(key: str) -> str:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM bot_settings WHERE key=$1", key)
+        return row['value'] if row else ""
+
+async def _set_setting(key: str, value: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO bot_settings (key, value) VALUES ($1, $2) "
+            "ON CONFLICT (key) DO UPDATE SET value=$2",
+            key, value
+        )
+
+@dp.message(F.text == "⭐️ Купить Stars")
+async def buy_stars_start(m: types.Message, state: FSMContext):
+    rate_str = await _get_setting("star_rate")
+    payment_info = await _get_setting("star_payment")
+    if not rate_str or not payment_info:
+        await m.answer(
+            "⭐️ Продажа Stars временно недоступна.\n"
+            "Попробуй позже или напиши администратору."
+        )
+        return
+    rate = float(rate_str)
+    currency = await _get_setting("star_currency") or "руб."
+    presets = [50, 100, 250, 500, 1000, 2500]
+    preset_buttons = [
+        [InlineKeyboardButton(
+            text=f"{n} ⭐️ — {round(n / 50 * rate, 2):g} {currency}",
+            callback_data=f"starbuy_{n}"
+        )]
+        for n in presets
+    ]
+    preset_buttons.append(
+        [InlineKeyboardButton(text="✏️ Ввести другое количество", callback_data="starbuy_custom")]
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=preset_buttons)
+    await state.set_state(BuyStarsForm.waiting_amount)
+    await m.answer(
+        f"⭐️ <b>Купить Telegram Stars</b>\n\n"
+        f"Выбери количество или введи своё (минимум 50):",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+@dp.message(BuyStarsForm.waiting_amount, F.text & ~F.text.startswith("/"))
+async def buy_stars_amount(m: types.Message, state: FSMContext):
+    txt = (m.text or "").strip()
+    if not txt.isdigit():
+        await m.answer("❌ Введи целое число, например: <code>100</code>", parse_mode="HTML")
+        return
+    amount = int(txt)
+    if amount < 50 or amount > 10000:
+        await m.answer("❌ Минимум 50, максимум 10 000 Stars.")
+        return
+    rate_str = await _get_setting("star_rate")
+    payment_info = await _get_setting("star_payment")
+    if not rate_str or not payment_info:
+        await state.clear()
+        await m.answer("❌ Продажа недоступна, попробуй позже.")
+        return
+    rate = float(rate_str)
+    currency = await _get_setting("star_currency") or "руб."
+    total = round(amount / 50 * rate, 2)
+    await state.update_data(amount=amount, total=total)
+    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Оплатил", callback_data=f"starpaid_{amount}_{total}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="starcancel_user")]
+    ])
+    await m.answer(
+        f"⭐️ <b>Твой заказ:</b> {amount} Stars\n"
+        f"💰 <b>Сумма к оплате:</b> {total:g} {html.escape(currency)}\n\n"
+        f"<b>Реквизиты для оплаты:</b>\n{html.escape(payment_info)}\n\n"
+        f"После оплаты нажми «✅ Оплатил» — мы проверим и отправим Stars.",
+        parse_mode="HTML",
+        reply_markup=confirm_kb
+    )
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("starbuy_"))
+async def starbuy_preset(c: types.CallbackQuery, state: FSMContext):
+    val = c.data[len("starbuy_"):]
+    if val == "custom":
+        await c.answer()
+        await c.message.edit_reply_markup(reply_markup=None)
+        await c.message.answer(
+            "✏️ Введи количество Stars (минимум 10, максимум 10 000):\n\nДля отмены: /cancel"
+        )
+        return
+    try:
+        amount = int(val)
+    except ValueError:
+        await c.answer("❌ Ошибка", show_alert=True)
+        return
+    rate_str = await _get_setting("star_rate")
+    payment_info = await _get_setting("star_payment")
+    currency = await _get_setting("star_currency") or "руб."
+    if not rate_str or not payment_info:
+        await c.answer("❌ Продажа недоступна, попробуй позже.", show_alert=True)
+        return
+    rate = float(rate_str)
+    total = round(amount / 50 * rate, 2)
+    await state.clear()
+    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Оплатил", callback_data=f"starpaid_{amount}_{total}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="starcancel_user")]
+    ])
+    await c.answer()
+    await c.message.edit_reply_markup(reply_markup=None)
+    await c.message.answer(
+        f"⭐️ <b>Твой заказ:</b> {amount} Stars\n"
+        f"💰 <b>Сумма к оплате:</b> {total:g} {html.escape(currency)}\n\n"
+        f"<b>Реквизиты для оплаты:</b>\n{html.escape(payment_info)}\n\n"
+        f"После оплаты нажми «✅ Оплатил» — мы проверим и отправим Stars.",
+        parse_mode="HTML",
+        reply_markup=confirm_kb
+    )
+
+@dp.callback_query(F.data.startswith("starpaid_"))
+async def buy_stars_paid(c: types.CallbackQuery):
+    parts = c.data.split("_")
+    amount = int(parts[1])
+    total = float(parts[2])
+    async with db_pool.acquire() as conn:
+        order_id = await conn.fetchval(
+            "INSERT INTO star_orders (user_id, username, full_name, amount_stars, price_total) "
+            "VALUES ($1, $2, $3, $4, $5) RETURNING id",
+            c.from_user.id, c.from_user.username, c.from_user.full_name,
+            amount, total
+        )
+    if ADMIN_ID:
+        who = f"@{c.from_user.username}" if c.from_user.username else c.from_user.full_name
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"⭐️ <b>Новый заказ Stars #{order_id}</b>\n"
+                f"👤 {html.escape(who or str(c.from_user.id))} (id: <code>{c.from_user.id}</code>)\n"
+                f"🌟 Количество: <b>{amount} Stars</b>\n"
+                f"💰 Сумма: <b>{total:g} руб.</b>\n\n"
+                f"Чтобы выполнить: <code>/stardone {order_id}</code>\n"
+                f"Чтобы отменить: <code>/stardecline {order_id}</code>",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logging.error(f"Ошибка уведомления админа о заказе Stars: {e}")
+    await c.message.edit_reply_markup(reply_markup=None)
+    await c.answer()
+    await c.message.answer(
+        f"✅ <b>Заявка #{order_id} принята!</b>\n\n"
+        f"Мы проверим оплату и отправим <b>{amount} ⭐️</b> в ближайшее время.\n"
+        f"Если возникнут вопросы — напиши администратору.",
+        parse_mode="HTML"
+    )
+
+@dp.callback_query(F.data == "starcancel_user")
+async def buy_stars_cancel_user(c: types.CallbackQuery):
+    await c.message.edit_reply_markup(reply_markup=None)
+    await c.answer("Заявка отменена")
+    await c.message.answer("❌ Заявка отменена.", reply_markup=menu)
+
+@dp.message(Command("setcurrency"))
+async def set_currency_cmd(m: types.Message):
+    if m.from_user.id != ADMIN_ID: return
+    args = m.text.split(maxsplit=1)
+    if len(args) < 2:
+        cur = await _get_setting("star_currency") or "руб."
+        await m.answer(
+            f"Текущая валюта: <b>{html.escape(cur)}</b>\n\n"
+            f"Использование: <code>/setcurrency USDT</code> или <code>/setcurrency AMD</code> или <code>/setcurrency $</code>",
+            parse_mode="HTML"
+        )
+        return
+    currency = args[1].strip()[:20]
+    await _set_setting("star_currency", currency)
+    await m.answer(f"✅ Валюта установлена: <b>{html.escape(currency)}</b>", parse_mode="HTML")
+
+@dp.message(Command("setstarrate"))
+async def set_star_rate(m: types.Message):
+    if m.from_user.id != ADMIN_ID: return
+    args = m.text.split(maxsplit=1)
+    currency = await _get_setting("star_currency") or "руб."
+    if len(args) < 2:
+        cur = await _get_setting("star_rate")
+        cur_txt = f"Текущая цена: 50 Stars = {cur} {currency}" if cur else "Цена не установлена"
+        await m.answer(
+            f"{cur_txt}\n\nИспользование: <code>/setstarrate 2.5</code>\n"
+            f"(цена за минимальный пакет — 50 Stars)",
+            parse_mode="HTML"
+        )
+        return
+    try:
+        rate = float(args[1].replace(",", "."))
+        assert rate > 0
+    except Exception:
+        await m.answer("❌ Введи корректное число, например: <code>/setstarrate 2.5</code>", parse_mode="HTML")
+        return
+    await _set_setting("star_rate", str(rate))
+    await m.answer(
+        f"✅ Цена установлена: 50 Stars = <b>{rate:g} {html.escape(currency)}</b>",
+        parse_mode="HTML"
+    )
+
+@dp.message(Command("setpayment"))
+async def set_payment_info(m: types.Message):
+    if m.from_user.id != ADMIN_ID: return
+    args = m.text.split(maxsplit=1)
+    if len(args) < 2:
+        cur = await _get_setting("star_payment")
+        cur_txt = f"Текущие реквизиты:\n{cur}" if cur else "Реквизиты не установлены"
+        await m.answer(
+            f"{cur_txt}\n\nИспользование:\n<code>/setpayment Карта 4276... Иванов И.И.</code>",
+            parse_mode="HTML"
+        )
+        return
+    await _set_setting("star_payment", args[1].strip())
+    await m.answer("✅ Реквизиты сохранены.", parse_mode="HTML")
+
+@dp.message(Command("starorders"))
+async def star_orders_cmd(m: types.Message):
+    if m.from_user.id != ADMIN_ID: return
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, user_id, username, full_name, amount_stars, price_total, status, created_at "
+            "FROM star_orders ORDER BY created_at DESC LIMIT 20"
+        )
+    if not rows:
+        await m.answer("📭 Заказов Stars пока нет.")
+        return
+    lines = ["⭐️ <b>Последние 20 заказов Stars:</b>\n"]
+    status_icons = {"pending": "⏳", "done": "✅", "declined": "❌"}
+    for r in rows:
+        who = f"@{r['username']}" if r['username'] else (r['full_name'] or f"id{r['user_id']}")
+        icon = status_icons.get(r['status'], "❓")
+        lines.append(
+            f"{icon} <b>#{r['id']}</b> {html.escape(who)} — "
+            f"<b>{r['amount_stars']} ⭐️</b> ({r['price_total']:g} руб.)"
+        )
+    await m.answer("\n".join(lines), parse_mode="HTML")
+
+@dp.message(Command("stardone"))
+async def star_done_cmd(m: types.Message):
+    if m.from_user.id != ADMIN_ID: return
+    args = m.text.split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip().isdigit():
+        await m.answer("Использование: <code>/stardone <id></code>", parse_mode="HTML")
+        return
+    oid = int(args[1].strip())
+    async with db_pool.acquire() as conn:
+        order = await conn.fetchrow(
+            "SELECT * FROM star_orders WHERE id=$1", oid
+        )
+        if not order:
+            await m.answer(f"❌ Заказ #{oid} не найден.")
+            return
+        if order['status'] != 'pending':
+            await m.answer(f"⚠️ Заказ #{oid} уже {order['status']}.")
+            return
+        await conn.execute(
+            "UPDATE star_orders SET status='done', updated_at=NOW() WHERE id=$1", oid
+        )
+    try:
+        await bot.send_message(
+            order['user_id'],
+            f"✅ <b>Заказ #{oid} выполнен!</b>\n\n"
+            f"Тебе отправлено <b>{order['amount_stars']} ⭐️</b>. Спасибо за покупку!",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await m.answer(f"⚠️ Не удалось уведомить пользователя: {e}")
+    await m.answer(f"✅ Заказ #{oid} помечен выполненным, пользователь уведомлён.")
+
+@dp.message(Command("stardecline"))
+async def star_decline_cmd(m: types.Message):
+    if m.from_user.id != ADMIN_ID: return
+    args = m.text.split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip().isdigit():
+        await m.answer("Использование: <code>/stardecline <id></code>", parse_mode="HTML")
+        return
+    oid = int(args[1].strip())
+    async with db_pool.acquire() as conn:
+        order = await conn.fetchrow(
+            "SELECT * FROM star_orders WHERE id=$1", oid
+        )
+        if not order:
+            await m.answer(f"❌ Заказ #{oid} не найден.")
+            return
+        if order['status'] != 'pending':
+            await m.answer(f"⚠️ Заказ #{oid} уже {order['status']}.")
+            return
+        await conn.execute(
+            "UPDATE star_orders SET status='declined', updated_at=NOW() WHERE id=$1", oid
+        )
+    try:
+        await bot.send_message(
+            order['user_id'],
+            f"❌ <b>Заказ #{oid} отменён.</b>\n\n"
+            f"К сожалению, мы не смогли подтвердить оплату. "
+            f"Если это ошибка — свяжись с администратором.",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await m.answer(f"⚠️ Не удалось уведомить пользователя: {e}")
+    await m.answer(f"✅ Заказ #{oid} отклонён, пользователь уведомлён.")
+
+def _manual_user_id(m: types.Message) -> int | None:
+    """Берёт ID из аргумента команды или из сообщения, на которое ответили."""
+    args = m.text.split(maxsplit=1) if m.text else []
+    if len(args) > 1 and args[1].strip().isdigit():
+        return int(args[1].strip())
+    replied = m.reply_to_message
+    if replied and replied.from_user:
+        return replied.from_user.id
+    return None
+
+@dp.message(Command("block"))
+async def block_user_cmd(m: types.Message):
+    if m.from_user.id != ADMIN_ID:
+        return
+    channel_id = get_channel_id()
+    if not channel_id:
+        await m.answer("❌ CHANNEL_ID не задан в переменных окружения.")
+        return
+    user_id = _manual_user_id(m)
+    if not user_id:
+        await m.answer(
+            "Использование: <code>/block &lt;user_id&gt;</code>\n"
+            "Или ответь командой /block на сообщение пользователя.",
+            parse_mode="HTML",
+        )
+        return
+    try:
+        await bot.ban_chat_member(chat_id=channel_id, user_id=user_id)
+        SUB_CACHE.pop(user_id, None)
+        await m.answer(
+            f"✅ Пользователь <code>{user_id}</code> заблокирован в канале.",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logging.error("Не удалось вручную заблокировать user=%s: %s", user_id, e)
+        await m.answer(
+            "❌ Не удалось заблокировать пользователя. Проверь, что бот "
+            "администратор канала с правом блокировки участников."
+        )
+
+@dp.message(Command("unblock"))
+async def unblock_user_cmd(m: types.Message):
+    if m.from_user.id != ADMIN_ID:
+        return
+    channel_id = get_channel_id()
+    if not channel_id:
+        await m.answer("❌ CHANNEL_ID не задан в переменных окружения.")
+        return
+    user_id = _manual_user_id(m)
+    if not user_id:
+        await m.answer(
+            "Использование: <code>/unblock &lt;user_id&gt;</code>\n"
+            "Или ответь командой /unblock на сообщение пользователя.",
+            parse_mode="HTML",
+        )
+        return
+    try:
+        await bot.unban_chat_member(
+            chat_id=channel_id,
+            user_id=user_id,
+            only_if_banned=True,
+        )
+        SUB_CACHE.pop(user_id, None)
+        await m.answer(
+            f"✅ Блокировка пользователя <code>{user_id}</code> снята.",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logging.error("Не удалось снять блокировку user=%s: %s", user_id, e)
+        await m.answer(
+            "❌ Не удалось снять блокировку. Проверь ID пользователя и права бота."
+        )
+
 # --- ЗАЯВКИ НА ТРЕКИ (ПОСТ + КОММЕНТАРИИ В ОБСУЖДАЛКЕ) ---
 
 REQUEST_DEFAULT_TEXT = (
@@ -2586,11 +3072,22 @@ async def main():
     except Exception as e:
         logging.warning(f"Не удалось получить webhook info: {e}")
         current_url = ""
+    allowed_updates = [
+        "message",
+        "callback_query",
+        "channel_post",
+        "pre_checkout_query",
+        "chat_member",
+    ]
+    await bot.set_webhook(
+        url=full_url,
+        drop_pending_updates=False,
+        allowed_updates=allowed_updates,
+    )
     if current_url != full_url:
-        await bot.set_webhook(url=full_url, drop_pending_updates=False)
         logging.info(f"✅ Webhook обновлён: {full_url}")
     else:
-        logging.info(f"✅ Webhook уже актуален: {full_url} — апдейты не сбрасываем")
+        logging.info("✅ Webhook проверен — chat_member апдейты включены")
 
     asyncio.create_task(vote_auto_close_loop())
     logging.info("✅ Авто-закрытие голосований запущено")
