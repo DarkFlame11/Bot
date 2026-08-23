@@ -3045,6 +3045,23 @@ async def main():
     app = web.Application()
     app.router.add_get("/", health_check)
     app.router.add_get("/health", health_check)
+        register_webapp(
+        app=app,
+        dp=dp,
+        bot=bot,
+        db_pool_getter=lambda: db_pool,
+        bot_token=BOT_TOKEN,
+        is_subscribed=is_subscribed,
+        run_search=run_search,
+        format_track=format_track,
+        track_keyboard=track_keyboard,
+        num_buttons=num_buttons,
+        static_dir=os.path.join(os.path.dirname(__file__), "webapp"),
+    )
+
+
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
 
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
