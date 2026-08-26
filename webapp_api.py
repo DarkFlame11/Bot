@@ -63,7 +63,7 @@ def validate_init_data(init_data: str, bot_token: str, max_age: int = 86400):
 
 def register_webapp(app: web.Application, dp, bot, db_pool_getter, bot_token: str,
                      is_subscribed, run_search, format_track, track_keyboard,
-                     num_buttons, static_dir: str):
+                     num_buttons, static_dir: str, max_playlists: int = 5):
     """Регистрирует API-роуты и обработчик web_app_data.
     Вызови это один раз из main() в main.py — см. инструкцию ниже."""
 
@@ -157,12 +157,54 @@ def register_webapp(app: web.Application, dp, bot, db_pool_getter, bot_token: st
             "items": [{"id": r["id"], "title": r["title"], "artist": r["artist"]} for r in rows]
         })
 
+    async def api_playlists(request):
+        user, err = await _require_user(request)
+        if err:
+            return err
+        pool = db_pool_getter()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT p.id, p.name, COUNT(pt.track_id) AS cnt "
+                "FROM playlists p LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id "
+                "WHERE p.user_id=$1 GROUP BY p.id, p.name ORDER BY p.id",
+                user["id"],
+            )
+        return web.json_response({
+            "max": max_playlists,
+            "items": [{"id": r["id"], "name": r["name"], "count": r["cnt"]} for r in rows],
+        })
+
+    async def api_playlist_tracks(request):
+        user, err = await _require_user(request)
+        if err:
+            return err
+        pid = int(request.match_info["pid"])
+        pool = db_pool_getter()
+        async with pool.acquire() as conn:
+            pl = await conn.fetchrow(
+                "SELECT id, name FROM playlists WHERE id=$1 AND user_id=$2", pid, user["id"]
+            )
+            if not pl:
+                return web.json_response({"error": "not_found"}, status=404)
+            rows = await conn.fetch(
+                "SELECT tracks.id, tracks.title, tracks.artist FROM tracks "
+                "JOIN playlist_tracks ON tracks.id = playlist_tracks.track_id "
+                "WHERE playlist_tracks.playlist_id=$1 ORDER BY playlist_tracks.added_at",
+                pid,
+            )
+        return web.json_response({
+            "name": pl["name"],
+            "items": [{"id": r["id"], "title": r["title"], "artist": r["artist"]} for r in rows],
+        })
+
     app.router.add_get("/app", serve_app)
     app.router.add_get("/api/search", api_search)
     app.router.add_get("/api/top", api_top)
     app.router.add_get("/api/new", api_new)
     app.router.add_get("/api/random", api_random)
     app.router.add_get("/api/favorites", api_favorites)
+    app.router.add_get("/api/playlists", api_playlists)
+    app.router.add_get("/api/playlists/{pid}", api_playlist_tracks)
 
     @dp.message(F.web_app_data)
     async def webapp_data_handler(m: types.Message):
@@ -200,6 +242,69 @@ def register_webapp(app: web.Application, dp, bot, db_pool_getter, bot_token: st
                         m.from_user.id, tid,
                     )
                     await m.answer("❤️ Добавлено в избранное")
+
+        elif action == "playlist_create":
+            name = (payload.get("name") or "").strip()
+            if not name or len(name) > 50:
+                await m.answer("❌ Название плейлиста — от 1 до 50 символов.")
+                return
+            async with pool.acquire() as conn:
+                count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM playlists WHERE user_id=$1", m.from_user.id
+                )
+                if count >= max_playlists:
+                    await m.answer(f"❌ Максимум {max_playlists} плейлистов. Удали один перед созданием нового.")
+                    return
+                await conn.execute(
+                    "INSERT INTO playlists (user_id, name) VALUES ($1, $2)", m.from_user.id, name
+                )
+            import html as _html
+            await m.answer(f"✅ «{_html.escape(name)}» создан!")
+
+        elif action == "playlist_delete":
+            pid = int(payload.get("playlist_id", 0) or 0)
+            async with pool.acquire() as conn:
+                owned = await conn.fetchval(
+                    "SELECT 1 FROM playlists WHERE id=$1 AND user_id=$2", pid, m.from_user.id
+                )
+                if not owned:
+                    await m.answer("❌ Плейлист не найден.")
+                    return
+                await conn.execute("DELETE FROM playlists WHERE id=$1", pid)
+            await m.answer("🗑 Плейлист удалён")
+
+        elif action == "playlist_add":
+            pid = int(payload.get("playlist_id", 0) or 0)
+            tid = int(payload.get("track_id", 0) or 0)
+            async with pool.acquire() as conn:
+                pl = await conn.fetchrow(
+                    "SELECT name FROM playlists WHERE id=$1 AND user_id=$2", pid, m.from_user.id
+                )
+                if not pl:
+                    await m.answer("❌ Плейлист не найден.")
+                    return
+                await conn.execute(
+                    "INSERT INTO playlist_tracks (playlist_id, track_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                    pid, tid,
+                )
+            import html as _html
+            await m.answer(f"✅ Добавлено в «{_html.escape(pl['name'])}»")
+
+        elif action == "playlist_remove":
+            pid = int(payload.get("playlist_id", 0) or 0)
+            tid = int(payload.get("track_id", 0) or 0)
+            async with pool.acquire() as conn:
+                pl = await conn.fetchrow(
+                    "SELECT name FROM playlists WHERE id=$1 AND user_id=$2", pid, m.from_user.id
+                )
+                if not pl:
+                    await m.answer("❌ Плейлист не найден.")
+                    return
+                await conn.execute(
+                    "DELETE FROM playlist_tracks WHERE playlist_id=$1 AND track_id=$2", pid, tid
+                )
+            import html as _html
+            await m.answer(f"🗑 Убрано из «{_html.escape(pl['name'])}»")
 
         elif action == "search":
             query = (payload.get("query") or "").strip()
