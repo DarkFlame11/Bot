@@ -318,6 +318,13 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Исправляем старые записи, где plays мог быть NULL.
+        await conn.execute(
+            "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS plays INTEGER DEFAULT 0"
+        )
+        await conn.execute("UPDATE tracks SET plays = 0 WHERE plays IS NULL")
+        await conn.execute("ALTER TABLE tracks ALTER COLUMN plays SET DEFAULT 0")
+        await conn.execute("ALTER TABLE tracks ALTER COLUMN plays SET NOT NULL")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS favorites (
                 user_id BIGINT NOT NULL,
@@ -960,8 +967,7 @@ async def _send_random_track(target, user_id: int, query: str = ""):
                 else:
                     await target.answer("❌ Нет треков", show_alert=True)
                 return
-            await conn.execute("UPDATE tracks SET plays=plays+1 WHERE id=$1", r['id'])
-        kb = await track_keyboard(r['id'], user_id)
+        await _send_track_audio(target, r['id'], user_id, r['file_id'])
         if isinstance(target, types.Message):
             await target.answer_audio(r['file_id'], reply_markup=kb)
         else:
@@ -970,6 +976,37 @@ async def _send_random_track(target, user_id: int, query: str = ""):
     except Exception as e:
         logging.error(f"Ошибка в _send_random_track: {e}")
 
+async def _send_track_audio(target, track_id: int, user_id: int, file_id: str = None):
+    """Отправить трек и засчитать прослушивание только после успешной отправки."""
+    if file_id is None:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id, file_id FROM tracks WHERE id=$1", track_id
+            )
+        if not row:
+            if isinstance(target, types.Message):
+                await target.answer("❌ Трек не найден")
+            else:
+                await target.answer("❌ Трек не найден", show_alert=True)
+            return False
+        file_id = row["file_id"]
+
+    kb = await track_keyboard(track_id, user_id)
+    if isinstance(target, types.Message):
+        await target.answer_audio(file_id, reply_markup=kb)
+    else:
+        await target.message.answer_audio(file_id, reply_markup=kb)
+        await target.answer()
+
+    async with db_pool.acquire() as conn:
+        updated = await conn.execute(
+            "UPDATE tracks SET plays=COALESCE(plays, 0)+1 WHERE id=$1",
+            track_id
+        )
+    if updated != "UPDATE 1":
+        logging.warning("Не удалось засчитать прослушивание трека id=%s", track_id)
+        return False
+    return True
 @dp.message(F.text == "🎲 Случайный")
 async def rnd(m: types.Message):
     await _send_random_track(m, m.from_user.id)
@@ -1001,7 +1038,11 @@ async def top(m: types.Message):
     pool = await get_db()
     try:
         async with pool.acquire() as conn:
-            res = await conn.fetch("SELECT artist, title, plays FROM tracks ORDER BY plays DESC LIMIT 10")
+            res = await conn.fetch(
+                "SELECT id, artist, title, COALESCE(plays, 0) AS plays "
+                "FROM tracks "
+                "ORDER BY COALESCE(plays, 0) DESC, id ASC LIMIT 10"
+            )
         if not res:
             await m.answer("❌ Пусто")
             return
@@ -1047,13 +1088,8 @@ async def rnd_fav_cb(c: types.CallbackQuery):
             return
         ids = [r['track_id'] for r in track_ids]
         chosen = random.choice(ids)
-        async with db_pool.acquire() as conn:
-            r = await conn.fetchrow("SELECT id, file_id FROM tracks WHERE id=$1", chosen)
-            if r:
-                await conn.execute("UPDATE tracks SET plays=plays+1 WHERE id=$1", chosen)
-        kb = await track_keyboard(r['id'], c.from_user.id)
-        await c.message.answer_audio(r['file_id'], reply_markup=kb)
-        await c.answer()
+        await _send_track_audio(c, chosen, c.from_user.id)
+
     except Exception as e:
         logging.error(f"Ошибка в rnd_fav_cb: {e}")
         await c.answer("❌ Ошибка", show_alert=True)
@@ -1077,13 +1113,8 @@ async def rnd_pl_cb(c: types.CallbackQuery):
             return
         ids = [r['track_id'] for r in track_ids]
         chosen = random.choice(ids)
-        async with db_pool.acquire() as conn:
-            r = await conn.fetchrow("SELECT id, file_id FROM tracks WHERE id=$1", chosen)
-            if r:
-                await conn.execute("UPDATE tracks SET plays=plays+1 WHERE id=$1", chosen)
-        kb = await track_keyboard(r['id'], c.from_user.id)
-        await c.message.answer_audio(r['file_id'], reply_markup=kb)
-        await c.answer()
+        await _send_track_audio(c, chosen, c.from_user.id)
+
     except Exception as e:
         logging.error(f"Ошибка в rnd_pl_cb: {e}")
         await c.answer("❌ Ошибка", show_alert=True)
@@ -1236,15 +1267,7 @@ async def rmpl(c: types.CallbackQuery):
 async def st(c: types.CallbackQuery):
     try:
         tid = int(c.data.split("_")[1])
-        pool = await get_db()
-        async with pool.acquire() as conn:
-            r = await conn.fetchrow("SELECT id, file_id FROM tracks WHERE id=$1", tid)
-            if not r:
-                await c.answer("❌ Трек не найден", show_alert=True)
-                return
-            await conn.execute("UPDATE tracks SET plays=plays+1 WHERE id=$1", tid)
-        await c.message.answer_audio(r['file_id'], reply_markup=await track_keyboard(tid, c.from_user.id))
-        await c.answer()
+        await _send_track_audio(c, tid, c.from_user.id)
     except Exception as e:
         logging.error(f"Ошибка в st: {e}")
 
