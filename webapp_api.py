@@ -64,11 +64,43 @@ def validate_init_data(init_data: str, bot_token: str, max_age: int = 86400):
     return {"user": user, "auth_date": auth_date}
 
 
+def _is_initial_range(range_header: str | None) -> bool:
+    """True, если это первый запрос трека — без Range или Range вида
+    'bytes=0-...'. Браузерный <audio> почти всегда шлёт Range даже на
+    самый первый запрос, поэтому проверять просто "нет заголовка" нельзя —
+    так прослушивание почти никогда бы не засчитывалось."""
+    if not range_header:
+        return True
+    rh = range_header.strip().lower().replace(" ", "")
+    return rh.startswith("bytes=0-")
+
+
 def register_webapp(app: web.Application, dp, bot, db_pool_getter, bot_token: str,
                      is_subscribed, run_search, format_track, track_keyboard,
                      num_buttons, static_dir: str, max_playlists: int = 5):
     """Регистрирует API-роуты и обработчик web_app_data.
     Вызови это один раз из main() в main.py — см. инструкцию ниже."""
+
+    # Дедупликация счётчика прослушиваний: один и тот же пользователь
+    # не накручивает plays повторными bytes=0- запросами (перезагрузка
+    # страницы, повторный play/pause и т.п.) в течение короткого окна.
+    _recent_plays: dict[tuple[int, int], float] = {}
+    PLAY_DEDUPE_WINDOW = 20.0  # секунд
+
+    def _should_count_play(user_id: int, tid: int) -> bool:
+        now = time.time()
+        key = (user_id, tid)
+        last = _recent_plays.get(key)
+        if last is not None and now - last < PLAY_DEDUPE_WINDOW:
+            return False
+        _recent_plays[key] = now
+        # лёгкая чистка, чтобы словарь не рос бесконечно
+        if len(_recent_plays) > 5000:
+            cutoff = now - PLAY_DEDUPE_WINDOW
+            for k, v in list(_recent_plays.items()):
+                if v < cutoff:
+                    _recent_plays.pop(k, None)
+        return True
 
     async def _auth_user(request):
         init_data = request.headers.get("X-Telegram-Init-Data", "")
@@ -273,9 +305,10 @@ def register_webapp(app: web.Application, dp, bot, db_pool_getter, bot_token: st
                 return web.Response(status=502, text="telegram_error")
             upstream = await session.get(file_url, headers=fwd_headers)
 
-        # Считаем прослушивание только на самом первом запросе (без Range),
-        # чтобы перемотка не накручивала счётчик.
-        if not range_header:
+        # Считаем прослушивание на первом запросе диапазона (нет Range или
+        # Range начинается с bytes=0-), с дедупликацией по (user, track) —
+        # чтобы не накручивать счётчик перемоткой/повторными запросами.
+        if _is_initial_range(range_header) and _should_count_play(user["id"], tid):
             async with pool.acquire() as conn:
                 await conn.execute("UPDATE tracks SET plays=plays+1 WHERE id=$1", tid)
 
