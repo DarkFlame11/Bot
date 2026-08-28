@@ -135,6 +135,45 @@
   .play-circle.playing{background:var(--blue);}
   .play-circle.playing svg{fill:#0a0a0a;}
   body.player-open{ padding-bottom:calc(148px + var(--safe-bottom)); }
+  .player-bar{cursor:pointer;}
+
+  /* FULLSCREEN NOW PLAYING */
+  .now-playing{
+    position:fixed; inset:0; background:#000; z-index:200; display:none;
+    flex-direction:column; padding:calc(18px + var(--safe-top)) 24px calc(28px + var(--safe-bottom));
+  }
+  .now-playing.show{display:flex;}
+  .np-top{display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;}
+  .np-back{background:none; border:none; color:var(--dim); font-size:22px; cursor:pointer; padding:6px;}
+  .np-eyebrow{font-size:11px; text-transform:uppercase; letter-spacing:0.15em; color:var(--gold); font-weight:700;}
+  .np-art{
+    flex:1; display:flex; align-items:center; justify-content:center; min-height:0;
+  }
+  .np-art img{
+    width:min(70vw, 280px); height:min(70vw, 280px); object-fit:contain;
+    filter:drop-shadow(0 20px 60px rgba(139,92,246,0.25));
+  }
+  .np-meta{text-align:center; margin-top:8px;}
+  .np-artist{color:var(--blue); font-weight:700; font-size:15px;}
+  .np-title{font-family:'Playfair Display', serif; font-style:italic; font-weight:700; font-size:24px; margin-top:6px; line-height:1.2;}
+  .np-progress-row{display:flex; align-items:center; gap:10px; margin-top:28px;}
+  .np-time{font-size:11px; color:var(--dim); width:34px; flex-shrink:0;}
+  .np-time.end{text-align:right;}
+  .np-progress{flex:1; height:4px; background:var(--card-2); border-radius:3px; position:relative; cursor:pointer;}
+  .np-progress .fill{height:100%; border-radius:3px; background:linear-gradient(90deg, var(--g1), var(--g2), var(--g3)); width:0%;}
+  .np-controls{display:flex; align-items:center; justify-content:center; gap:28px; margin-top:30px;}
+  .np-play{
+    width:72px; height:72px; border-radius:50%; background:var(--blue); border:none; cursor:pointer;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .np-play svg{width:26px; height:26px; fill:#0a0a0a;}
+  .np-side{
+    width:48px; height:48px; border-radius:50%; background:var(--card); border:1px solid var(--line); cursor:pointer;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .np-side svg{width:18px; height:18px; fill:var(--silver);}
+  .np-extra{display:flex; justify-content:center; gap:20px; margin-top:26px;}
+  .np-extra button{background:none; border:none; color:var(--dim); font-size:20px; cursor:pointer;}
 </style>
 </head>
 <body>
@@ -191,6 +230,39 @@
 </div>
 <audio id="audioEl" preload="none"></audio>
 
+<div class="now-playing" id="nowPlaying">
+  <div class="np-top">
+    <button class="np-back" id="npBack" aria-label="Свернуть">‹</button>
+    <div class="np-eyebrow">Сейчас играет</div>
+    <div style="width:34px"></div>
+  </div>
+  <div class="np-art"><img id="npArt" alt=""></div>
+  <div class="np-meta">
+    <div class="np-artist" id="npArtist"></div>
+    <div class="np-title" id="npTitle"></div>
+  </div>
+  <div class="np-progress-row">
+    <div class="np-time" id="npTimeCur">0:00</div>
+    <div class="np-progress" id="npProgress"><div class="fill" id="npFill"></div></div>
+    <div class="np-time end" id="npTimeEnd">0:00</div>
+  </div>
+  <div class="np-controls">
+    <button class="np-side" id="npPrev" aria-label="Предыдущий">
+      <svg viewBox="0 0 24 24"><path d="M6 5 H8 V19 H6 Z"/><path d="M20 6 L9 12 L20 18 Z"/></svg>
+    </button>
+    <button class="np-play" id="npPlay" aria-label="Пауза/Play">
+      <svg id="npPlayIcon" viewBox="0 0 24 24"><path d="M6 4 L20 12 L6 20 Z"/></svg>
+    </button>
+    <button class="np-side" id="npNext" aria-label="Следующий трек">
+      <svg viewBox="0 0 24 24"><path d="M18 5 H16 V19 H18 Z"/><path d="M4 6 L15 12 L4 18 Z"/></svg>
+    </button>
+  </div>
+  <div class="np-extra">
+    <button id="npFav" aria-label="В избранное">🤍</button>
+    <button id="npAdd" aria-label="В плейлист">➕</button>
+  </div>
+</div>
+
 <div class="sheet-overlay" id="sheetOverlay">
   <div class="sheet">
     <h4>Добавить в плейлист</h4>
@@ -200,6 +272,7 @@
 
 <script>
   const tg = window.Telegram ? window.Telegram.WebApp : null;
+  let currentQueue = [];
   const listEl = document.getElementById('list');
   const feedLabel = document.getElementById('feedLabel');
   const queryInput = document.getElementById('query');
@@ -226,8 +299,10 @@
     opts = opts || {};
     if (!items || !items.length){
       listEl.innerHTML = '<p class="empty">Пусто</p>';
+      currentQueue = [];
       return;
     }
+    currentQueue = items.slice();
     listEl.innerHTML = '';
     if (opts.backTo){
       const back = document.createElement('div');
@@ -405,14 +480,40 @@
   const pTitle = document.getElementById('pTitle');
   const playerClose = document.getElementById('playerClose');
 
+  const nowPlaying = document.getElementById('nowPlaying');
+  const npBack = document.getElementById('npBack');
+  const npArt = document.getElementById('npArt');
+  const npArtist = document.getElementById('npArtist');
+  const npTitle = document.getElementById('npTitle');
+  const npProgress = document.getElementById('npProgress');
+  const npFill = document.getElementById('npFill');
+  const npTimeCur = document.getElementById('npTimeCur');
+  const npTimeEnd = document.getElementById('npTimeEnd');
+  const npPlay = document.getElementById('npPlay');
+  const npPlayIcon = document.getElementById('npPlayIcon');
+  const npPrev = document.getElementById('npPrev');
+  const npNext = document.getElementById('npNext');
+  const npFav = document.getElementById('npFav');
+  const npAdd = document.getElementById('npAdd');
+
   let currentTrackId = null;
   let currentBtn = null;
+  let currentIndex = -1;
+  let isRandomSource = false;
 
   const ICON_PLAY = '<path d="M6 4 L20 12 L6 20 Z"/>';
   const ICON_PAUSE = '<path d="M6 4 H10 V20 H6 Z"/><path d="M14 4 H18 V20 H14 Z"/>';
 
+  function fmtTime(sec){
+    if (!isFinite(sec) || sec < 0) sec = 0;
+    const m = Math.floor(sec / 60);
+    const s = Math.floor(sec % 60).toString().padStart(2, '0');
+    return `${m}:${s}`;
+  }
+
   function setPlayingUI(playing){
     playerIcon.innerHTML = playing ? ICON_PAUSE : ICON_PLAY;
+    npPlayIcon.innerHTML = playing ? ICON_PAUSE : ICON_PLAY;
     if (currentBtn) currentBtn.classList.toggle('playing', playing);
   }
 
@@ -424,21 +525,24 @@
     else if (status === 502) msg = 'Telegram не отдал файл. Возможно, трек слишком большой (лимит скачивания через бота — 20 МБ) или файл устарел.';
     else if (status === 0) msg = 'Нет соединения с сервером.';
     playerBar.classList.remove('show');
+    nowPlaying.classList.remove('show');
     document.body.classList.remove('player-open');
     listEl.insertAdjacentHTML('afterbegin', `<div class="gate">${msg}${text ? ' <br><span style="opacity:.6;font-size:11px">(' + escapeHtml(text.slice(0,120)) + ')</span>' : ''}</div>`);
   }
 
-  async function playTrack(id, artist, title, btn){
+  const npArtSrc = document.querySelector('.logo-badge') ? document.querySelector('.logo-badge').src : '';
+
+  /** Основная функция запуска трека. index — позиция в currentQueue (для next/prev), или -1 для одиночных треков (случайный). */
+  async function loadAndPlay(id, artist, title, btn, index){
     if (currentTrackId === id) {
       if (audioEl.paused) { audioEl.play(); } else { audioEl.pause(); }
+      nowPlaying.classList.add('show');
       return;
     }
 
     const initData = tg ? tg.initData : '';
     const url = '/api/stream/' + id + '?init_data=' + encodeURIComponent(initData);
 
-    // Сначала лёгкая проверка (1 байт), чтобы понять реальную причину сбоя,
-    // а не просто ловить общее событие 'error' на <audio>.
     let check;
     try {
       check = await fetch(url, { headers: { 'Range': 'bytes=0-1' } });
@@ -455,21 +559,61 @@
     if (currentBtn) currentBtn.classList.remove('playing');
     currentTrackId = id;
     currentBtn = btn;
+    currentIndex = (typeof index === 'number') ? index : -1;
+
     pArtist.textContent = artist;
     pTitle.textContent = title;
+    npArtist.textContent = artist;
+    npTitle.textContent = title;
+    npArt.src = npArtSrc;
+
     playerBar.classList.add('show');
+    nowPlaying.classList.add('show');
     document.body.classList.add('player-open');
 
     audioEl.src = url;
     audioEl.play().catch(() => {});
   }
 
+  function playFromQueue(id, artist, title, btn){
+    isRandomSource = false;
+    const idx = currentQueue.findIndex(t => t.id === id);
+    loadAndPlay(id, artist, title, btn, idx);
+  }
+
+  async function playRandom(){
+    isRandomSource = true;
+    try {
+      const data = await apiGet('/api/random');
+      if (data.item) loadAndPlay(data.item.id, data.item.artist, data.item.title, null, -1);
+    } catch (e) {}
+  }
+
+  async function goNext(){
+    if (isRandomSource) { playRandom(); return; }
+    if (!currentQueue.length) return;
+    const idx = (currentIndex + 1) % currentQueue.length;
+    const t = currentQueue[idx];
+    loadAndPlay(t.id, t.artist, t.title, null, idx);
+  }
+
+  function goPrev(){
+    if (isRandomSource || !currentQueue.length) return;
+    const idx = (currentIndex - 1 + currentQueue.length) % currentQueue.length;
+    const t = currentQueue[idx];
+    loadAndPlay(t.id, t.artist, t.title, null, idx);
+  }
+
   audioEl.addEventListener('play', () => setPlayingUI(true));
   audioEl.addEventListener('pause', () => setPlayingUI(false));
-  audioEl.addEventListener('ended', () => setPlayingUI(false));
+  audioEl.addEventListener('ended', () => { setPlayingUI(false); goNext(); });
   audioEl.addEventListener('timeupdate', () => {
     if (audioEl.duration) {
-      playerFill.style.width = (audioEl.currentTime / audioEl.duration * 100) + '%';
+      const pct = (audioEl.currentTime / audioEl.duration * 100) + '%';
+      playerFill.style.width = pct;
+      npFill.style.width = pct;
+      npTimeCur.textContent = fmtTime(audioEl.currentTime);
+      npTimeEnd.textContent = fmtTime(audioEl.duration);
     }
   });
   audioEl.addEventListener('error', () => {
@@ -479,21 +623,54 @@
   playerToggle.addEventListener('click', () => {
     if (audioEl.paused) audioEl.play(); else audioEl.pause();
   });
-
-  playerProgress.addEventListener('click', (e) => {
-    if (!audioEl.duration) return;
-    const rect = playerProgress.getBoundingClientRect();
-    const ratio = (e.clientX - rect.left) / rect.width;
-    audioEl.currentTime = ratio * audioEl.duration;
+  npPlay.addEventListener('click', () => {
+    if (audioEl.paused) audioEl.play(); else audioEl.pause();
   });
 
-  playerClose.addEventListener('click', () => {
+  function seekFrom(el){
+    if (!audioEl.duration) return;
+    return (e) => {
+      const rect = el.getBoundingClientRect();
+      const ratio = (e.clientX - rect.left) / rect.width;
+      audioEl.currentTime = Math.max(0, Math.min(1, ratio)) * audioEl.duration;
+    };
+  }
+  playerProgress.addEventListener('click', (e) => { const f = seekFrom(playerProgress); if (f) f(e); });
+  npProgress.addEventListener('click', (e) => { const f = seekFrom(npProgress); if (f) f(e); });
+
+  npNext.addEventListener('click', goNext);
+  npPrev.addEventListener('click', goPrev);
+
+  // Тап по мини-плееру снизу — снова открыть полноэкранную страницу
+  playerBar.addEventListener('click', (e) => {
+    if (e.target.closest('.player-close') || e.target.closest('.player-toggle')) return;
+    nowPlaying.classList.add('show');
+  });
+
+  npBack.addEventListener('click', () => {
+    nowPlaying.classList.remove('show'); // трек продолжает играть, просто сворачиваем
+  });
+
+  npFav.addEventListener('click', () => {
+    if (currentTrackId && tg && tg.sendData) {
+      npFav.textContent = '❤️';
+      tg.sendData(JSON.stringify({ action: 'fav', track_id: currentTrackId }));
+    }
+  });
+  npAdd.addEventListener('click', () => {
+    if (currentTrackId) openAddToPlaylistSheet(currentTrackId);
+  });
+
+  playerClose.addEventListener('click', (e) => {
+    e.stopPropagation();
     audioEl.pause();
     audioEl.src = '';
     currentTrackId = null;
+    currentIndex = -1;
     if (currentBtn) currentBtn.classList.remove('playing');
     currentBtn = null;
     playerBar.classList.remove('show');
+    nowPlaying.classList.remove('show');
     document.body.classList.remove('player-open');
   });
 
@@ -506,7 +683,7 @@
     const plDel = e.target.closest('.pl-del');
 
     if (play) {
-      playTrack(Number(play.dataset.id), play.dataset.artist, play.dataset.title, play);
+      playFromQueue(Number(play.dataset.id), play.dataset.artist, play.dataset.title, play);
     }
     if (fav && tg && tg.sendData) {
       fav.textContent = '❤️';
@@ -533,12 +710,7 @@
   if (tg) {
     tg.MainButton.setText('🎲 Случайный трек');
     tg.MainButton.show();
-    tg.MainButton.onClick(async () => {
-      try {
-        const data = await apiGet('/api/random');
-        if (data.item) playTrack(data.item.id, data.item.artist, data.item.title, null);
-      } catch (e) {}
-    });
+    tg.MainButton.onClick(playRandom);
   }
 
   document.getElementById('shareLink').addEventListener('click', (e) => {
