@@ -218,6 +218,20 @@ def register_webapp(app: web.Application, dp, bot, db_pool_getter, bot_token: st
             _http_session_holder["session"] = s
         return s
 
+    # Кэш file_path из Telegram, чтобы не дёргать getFile при каждом плее
+    # одного и того же трека (это была основная причина задержки).
+    _file_path_cache = {}
+    FILE_PATH_TTL = 1800  # 30 минут — с запасом от реального срока жизни file_path
+
+    async def _resolve_file_url(track_id, file_id):
+        cached = _file_path_cache.get(track_id)
+        now = time.time()
+        if cached and cached[1] > now:
+            return f"https://api.telegram.org/file/bot{bot_token}/{cached[0]}"
+        tg_file = await bot.get_file(file_id)
+        _file_path_cache[track_id] = (tg_file.file_path, now + FILE_PATH_TTL)
+        return f"https://api.telegram.org/file/bot{bot_token}/{tg_file.file_path}"
+
     async def api_stream(request):
         user = await _auth_from_query(request)
         if not user:
@@ -233,17 +247,31 @@ def register_webapp(app: web.Application, dp, bot, db_pool_getter, bot_token: st
             return web.Response(status=404, text="not_found")
 
         try:
-            tg_file = await bot.get_file(row["file_id"])
+            file_url = await _resolve_file_url(tid, row["file_id"])
         except Exception:
-            return web.Response(status=502, text="telegram_error")
-
-        file_url = f"https://api.telegram.org/file/bot{bot_token}/{tg_file.file_path}"
+            # Кэш мог протухнуть раньше времени — пробуем ещё раз с нуля
+            _file_path_cache.pop(tid, None)
+            try:
+                file_url = await _resolve_file_url(tid, row["file_id"])
+            except Exception:
+                return web.Response(status=502, text="telegram_error")
 
         range_header = request.headers.get("Range")
         fwd_headers = {"Range": range_header} if range_header else {}
 
         session = await _get_http_session()
         upstream = await session.get(file_url, headers=fwd_headers)
+
+        # Если ссылка протухла (Telegram отдал 404/403 на файл) — сбрасываем
+        # кэш и пробуем один раз заново перед тем, как сдаться.
+        if upstream.status in (403, 404):
+            upstream.release()
+            _file_path_cache.pop(tid, None)
+            try:
+                file_url = await _resolve_file_url(tid, row["file_id"])
+            except Exception:
+                return web.Response(status=502, text="telegram_error")
+            upstream = await session.get(file_url, headers=fwd_headers)
 
         # Считаем прослушивание только на самом первом запросе (без Range),
         # чтобы перемотка не накручивала счётчик.
