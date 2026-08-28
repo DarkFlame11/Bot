@@ -416,11 +416,42 @@
     if (currentBtn) currentBtn.classList.toggle('playing', playing);
   }
 
-  function playTrack(id, artist, title, btn){
+  function showStreamError(status, text){
+    let msg = 'Не удалось загрузить трек.';
+    if (status === 401) msg = 'Открой это внутри Telegram — так бот сможет тебя узнать.';
+    else if (status === 403) msg = 'Доступ только для подписчиков канала.';
+    else if (status === 404) msg = 'Трек не найден в базе.';
+    else if (status === 502) msg = 'Telegram не отдал файл. Возможно, трек слишком большой (лимит скачивания через бота — 20 МБ) или файл устарел.';
+    else if (status === 0) msg = 'Нет соединения с сервером.';
+    playerBar.classList.remove('show');
+    document.body.classList.remove('player-open');
+    listEl.insertAdjacentHTML('afterbegin', `<div class="gate">${msg}${text ? ' <br><span style="opacity:.6;font-size:11px">(' + escapeHtml(text.slice(0,120)) + ')</span>' : ''}</div>`);
+  }
+
+  async function playTrack(id, artist, title, btn){
     if (currentTrackId === id) {
       if (audioEl.paused) { audioEl.play(); } else { audioEl.pause(); }
       return;
     }
+
+    const initData = tg ? tg.initData : '';
+    const url = '/api/stream/' + id + '?init_data=' + encodeURIComponent(initData);
+
+    // Сначала лёгкая проверка (1 байт), чтобы понять реальную причину сбоя,
+    // а не просто ловить общее событие 'error' на <audio>.
+    let check;
+    try {
+      check = await fetch(url, { headers: { 'Range': 'bytes=0-1' } });
+    } catch (e) {
+      showStreamError(0, '');
+      return;
+    }
+    if (!check.ok && check.status !== 206) {
+      const text = await check.text().catch(() => '');
+      showStreamError(check.status, text);
+      return;
+    }
+
     if (currentBtn) currentBtn.classList.remove('playing');
     currentTrackId = id;
     currentBtn = btn;
@@ -429,8 +460,7 @@
     playerBar.classList.add('show');
     document.body.classList.add('player-open');
 
-    const initData = tg ? tg.initData : '';
-    audioEl.src = '/api/stream/' + id + '?init_data=' + encodeURIComponent(initData);
+    audioEl.src = url;
     audioEl.play().catch(() => {});
   }
 
@@ -443,7 +473,7 @@
     }
   });
   audioEl.addEventListener('error', () => {
-    showGate('api_error');
+    showStreamError(-1, 'audio_element_error');
   });
 
   playerToggle.addEventListener('click', () => {
