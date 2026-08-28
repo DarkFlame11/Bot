@@ -543,19 +543,6 @@
     const initData = tg ? tg.initData : '';
     const url = '/api/stream/' + id + '?init_data=' + encodeURIComponent(initData);
 
-    let check;
-    try {
-      check = await fetch(url, { headers: { 'Range': 'bytes=0-1' } });
-    } catch (e) {
-      showStreamError(0, '');
-      return;
-    }
-    if (!check.ok && check.status !== 206) {
-      const text = await check.text().catch(() => '');
-      showStreamError(check.status, text);
-      return;
-    }
-
     if (currentBtn) currentBtn.classList.remove('playing');
     currentTrackId = id;
     currentBtn = btn;
@@ -571,6 +558,9 @@
     nowPlaying.classList.add('show');
     document.body.classList.add('player-open');
 
+    // Играем сразу, без предварительной проверки — так быстрее.
+    // Если что-то не так, сработает событие 'error' на <audio>,
+    // и уже тогда сделаем один диагностический запрос, чтобы объяснить причину.
     audioEl.src = url;
     audioEl.play().catch(() => {});
   }
@@ -616,7 +606,21 @@
       npTimeEnd.textContent = fmtTime(audioEl.duration);
     }
   });
-  audioEl.addEventListener('error', () => {
+  audioEl.addEventListener('error', async () => {
+    // Реальный сбой — теперь делаем диагностический запрос, чтобы понять причину
+    const failedSrc = audioEl.src;
+    if (!failedSrc) return;
+    try {
+      const check = await fetch(failedSrc, { headers: { 'Range': 'bytes=0-1' } });
+      if (!check.ok && check.status !== 206) {
+        const text = await check.text().catch(() => '');
+        showStreamError(check.status, text);
+        return;
+      }
+    } catch (e) {
+      showStreamError(0, '');
+      return;
+    }
     showStreamError(-1, 'audio_element_error');
   });
 
