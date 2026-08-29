@@ -9,7 +9,6 @@ import datetime
 import unicodedata
 import asyncpg
 
-
 from aiohttp import web
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, types
