@@ -146,13 +146,21 @@
   .np-top{display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;}
   .np-back{background:none; border:none; color:var(--dim); font-size:22px; cursor:pointer; padding:6px;}
   .np-eyebrow{font-size:11px; text-transform:uppercase; letter-spacing:0.15em; color:var(--gold); font-weight:700;}
-  .np-art{
-    flex:1; display:flex; align-items:center; justify-content:center; min-height:0; border-radius:24px;
-  }
-  .np-art img{
-    width:min(70vw, 280px); border-radius: 25px; height:min(70vw, 280px); object-fit:contain;
-    filter:drop-shadow(0 20px 60px rgba(139,92,246,0.25));
-  }
+.np-art{
+  flex:1;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  min-height:0;
+  border-radius:24px;
+}
+.np-art img{
+  width:min(70vw, 280px);
+  border-radius:25px;
+  height:min(70vw, 280px);
+  object-fit:contain;
+  filter:drop-shadow(0 20px 60px rgba(139,92,246,0.25));
+}
   .np-meta{text-align:center; margin-top:8px;}
   .np-artist{color:var(--blue); font-weight:700; font-size:15px;}
   .np-title{font-family:'Playfair Display', serif; font-style:italic; font-weight:700; font-size:24px; margin-top:6px; line-height:1.2;}
