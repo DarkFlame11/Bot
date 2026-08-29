@@ -1,26 +1,22 @@
 import os
-import re
 import math
 import asyncio
 import logging
 import html
 import random
 import datetime
-import unicodedata
 import asyncpg
 
 from aiohttp import web
 
-from aiogram import BaseMiddleware, Bot, Dispatcher, F, types
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, LabeledPrice, PreCheckoutQuery
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
-
-from webapp_api import register_webapp
 
 # --- НАСТРОЙКИ ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -54,7 +50,7 @@ db_pool = None
 # --- БАЗА ДАННЫХ ---
 async def init_db_pool():
     global db_pool
-    kwargs = dict(min_size=2, max_size=10, command_timeout=10, statement_cache_size=0, timeout=10)
+    kwargs = dict(min_size=1, max_size=5, command_timeout=10, statement_cache_size=0, timeout=10)
     if USE_SSL:
         kwargs["ssl"] = "require"
     try:
@@ -69,242 +65,6 @@ async def init_db_pool():
 async def get_db():
     return db_pool
 
-async def register_user(user: types.User):
-    try:
-        async with db_pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO users (user_id, username, first_name, last_name)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (user_id) DO UPDATE SET
-                    username = EXCLUDED.username,
-                    first_name = EXCLUDED.first_name,
-                    last_name = EXCLUDED.last_name,
-                    last_seen = CURRENT_TIMESTAMP,
-                    is_active = TRUE
-            """, user.id, user.username, user.first_name, user.last_name)
-    except Exception as e:
-        logging.error(f"Ошибка регистрации пользователя: {e}")
-
-class RegisterUserMiddleware(BaseMiddleware):
-    async def __call__(self, handler, event, data):
-        user = None
-        if isinstance(event, types.Message) and event.from_user:
-            user = event.from_user
-        elif isinstance(event, types.CallbackQuery) and event.from_user:
-            user = event.from_user
-        if user and not user.is_bot:
-            await register_user(user)
-        return await handler(event, data)
-
-# --- ГЕЙТ ПОДПИСКИ НА КАНАЛ ---
-SUB_CACHE: dict[int, tuple[bool, float]] = {}
-# Положительный результат не кешируем: после выхода из канала доступ
-# должен закрываться при следующем действии пользователя.
-SUB_CACHE_TTL_OK = 0.0
-SUB_CACHE_TTL_FAIL = 30.0
-CHANNEL_INFO_CACHE: dict = {"url": None, "title": None, "fetched_at": 0.0}
-CHANNEL_INFO_TTL = 3600.0
-SUB_GATE_BYPASS_CALLBACKS = {"check_sub"}
-
-async def get_channel_info() -> tuple[str | None, str | None]:
-    """Возвращает (url, title) канала. Кеширует на час."""
-    now = asyncio.get_event_loop().time()
-    if (CHANNEL_INFO_CACHE["url"] or CHANNEL_INFO_CACHE["title"]) and \
-            now - CHANNEL_INFO_CACHE["fetched_at"] < CHANNEL_INFO_TTL:
-        return CHANNEL_INFO_CACHE["url"], CHANNEL_INFO_CACHE["title"]
-    cid = get_channel_id()
-    if not cid:
-        return None, None
-    url = None
-    title = None
-    try:
-        chat = await bot.get_chat(cid)
-        title = chat.title or None
-        if chat.username:
-            url = f"https://t.me/{chat.username}"
-        else:
-            url = chat.invite_link
-            if not url:
-                try:
-                    url = await bot.export_chat_invite_link(cid)
-                except Exception as e:
-                    logging.warning(f"Не удалось создать invite-ссылку канала: {e}")
-    except Exception as e:
-        logging.warning(f"Не удалось получить инфо канала: {e}")
-    CHANNEL_INFO_CACHE["url"] = url
-    CHANNEL_INFO_CACHE["title"] = title
-    CHANNEL_INFO_CACHE["fetched_at"] = now
-    return url, title
-
-async def is_subscribed(user_id: int) -> bool:
-    """Проверка подписки на CHANNEL_ID без кеша успешного результата."""
-    if user_id == ADMIN_ID:
-        return True
-    cid = get_channel_id()
-    if not cid:
-        logging.error("Проверка подписки невозможна: CHANNEL_ID не задан или некорректен")
-        return False
-    now = asyncio.get_event_loop().time()
-    cached = SUB_CACHE.get(user_id)
-    if cached:
-        ok, ts = cached
-        ttl = SUB_CACHE_TTL_OK if ok else SUB_CACHE_TTL_FAIL
-        if ttl > 0 and now - ts < ttl:
-            return ok
-    try:
-        member = await bot.get_chat_member(cid, user_id)
-        status = getattr(member, "status", None)
-        if status in ("creator", "administrator", "member"):
-            ok = True
-        elif status == "restricted":
-            ok = bool(getattr(member, "is_member", False))
-        else:
-            ok = False
-    except Exception as e:
-        logging.warning(f"Не удалось проверить подписку user={user_id}: {e}")
-        # Не пропускаем пользователя при недоступном/неверно настроенном канале.
-        # Иначе проверка подписки фактически отключается.
-        return False
-    if ok:
-        SUB_CACHE.pop(user_id, None)
-    else:
-        SUB_CACHE[user_id] = (ok, now)
-    return ok
-
-def _build_sub_gate_kb(channel_url: str | None) -> InlineKeyboardMarkup:
-    rows = []
-    if channel_url:
-        rows.append([InlineKeyboardButton(text="📢 Открыть канал", url=channel_url)])
-    rows.append([InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-async def send_sub_gate(event):
-    url, title = await get_channel_info()
-    title_html = html.escape(title) if title else "наш канал"
-    text = (
-        f"🔒 Доступ к боту только для подписчиков канала <b>{title_html}</b>.\n\n"
-        f"Подпишись и нажми «Я подписался» — и сразу продолжим."
-    )
-    kb = _build_sub_gate_kb(url)
-    if isinstance(event, types.CallbackQuery):
-        try:
-            await event.answer()
-        except Exception:
-            pass
-        msg = event.message
-        if msg:
-            try:
-                await msg.answer(text, parse_mode="HTML", reply_markup=kb)
-                return
-            except Exception:
-                pass
-    if isinstance(event, types.Message):
-        try:
-            await event.answer(text, parse_mode="HTML", reply_markup=kb)
-        except Exception as e:
-            logging.warning(f"Не удалось отправить sub-gate: {e}")
-
-class SubscriptionMiddleware(BaseMiddleware):
-    """Пускает в личку с ботом только подписчиков канала.
-    Админа, ботов, а также апдейты из групп/каналов/обсуждалок пропускает без проверки."""
-    async def __call__(self, handler, event, data):
-        user = getattr(event, 'from_user', None)
-        if not user or user.is_bot or user.id == ADMIN_ID:
-            return await handler(event, data)
-        # Определяем чат события
-        chat = None
-        if isinstance(event, types.Message):
-            chat = event.chat
-        elif isinstance(event, types.CallbackQuery) and event.message:
-            chat = event.message.chat
-        # Гейтим только личку с ботом — комментарии в обсуждалке и события каналов пропускаем
-        if chat is not None and chat.type != "private":
-            return await handler(event, data)
-        # Кнопка "Я подписался" должна доходить до своего обработчика
-        if isinstance(event, types.CallbackQuery) and event.data in SUB_GATE_BYPASS_CALLBACKS:
-            return await handler(event, data)
-        # PreCheckoutQuery и прочие апдейты без явного chat — не гейтим
-        if chat is None and not isinstance(event, types.Message):
-            return await handler(event, data)
-        if await is_subscribed(user.id):
-            return await handler(event, data)
-        await send_sub_gate(event)
-        return None
-
-CHANNEL_MEMBER_STATUSES = {"creator", "administrator", "member", "restricted"}
-
-@dp.chat_member()
-async def channel_member_update(update: types.ChatMemberUpdated):
-    """Блокирует пользователя в канале, если он вышел из него."""
-    channel_id = get_channel_id()
-    if not channel_id or update.chat.id != channel_id:
-        return
-
-    old_status = getattr(update.old_chat_member, "status", "")
-    new_status = getattr(update.new_chat_member, "status", "")
-    user = update.new_chat_member.user
-    was_member = (
-        old_status in CHANNEL_MEMBER_STATUSES
-        or (
-            old_status == "restricted"
-            and bool(getattr(update.old_chat_member, "is_member", False))
-        )
-    )
-    left_channel = new_status in {"left", "kicked"}
-
-    if not was_member or not left_channel or user.id == ADMIN_ID:
-        return
-
-    SUB_CACHE.pop(user.id, None)
-    try:
-        await bot.ban_chat_member(chat_id=channel_id, user_id=user.id)
-        logging.info(
-            "Пользователь %s автоматически заблокирован после выхода из канала %s",
-            user.id,
-            channel_id,
-        )
-    except Exception as e:
-        logging.error(
-            "Не удалось автоматически заблокировать user=%s в channel=%s: %s",
-            user.id,
-            channel_id,
-            e,
-        )
-
-class ThrottleMiddleware(BaseMiddleware):
-    """Антиспам: ограничивает частоту действий пользователя.
-    По умолчанию: не больше RATE_LIMIT_HITS событий за RATE_LIMIT_WINDOW секунд."""
-    RATE_LIMIT_HITS = 8
-    RATE_LIMIT_WINDOW = 5.0
-    WARN_COOLDOWN = 15.0
-
-    def __init__(self):
-        self._hits: dict[int, list[float]] = {}
-        self._last_warn: dict[int, float] = {}
-
-    async def __call__(self, handler, event, data):
-        user = getattr(event, 'from_user', None)
-        if not user or user.is_bot or user.id == ADMIN_ID:
-            return await handler(event, data)
-        now = asyncio.get_event_loop().time()
-        hits = self._hits.setdefault(user.id, [])
-        cutoff = now - self.RATE_LIMIT_WINDOW
-        hits[:] = [t for t in hits if t > cutoff]
-        hits.append(now)
-        if len(hits) > self.RATE_LIMIT_HITS:
-            last_warn = self._last_warn.get(user.id, 0)
-            if now - last_warn > self.WARN_COOLDOWN:
-                self._last_warn[user.id] = now
-                try:
-                    if isinstance(event, types.CallbackQuery):
-                        await event.answer("⏳ Слишком часто! Подожди немного.", show_alert=False)
-                    elif isinstance(event, types.Message):
-                        await event.answer("⏳ Слишком часто! Подожди пару секунд.")
-                except Exception:
-                    pass
-            return None
-        return await handler(event, data)
-
 async def init_db():
     pool = await get_db()
     async with pool.acquire() as conn:
@@ -318,13 +78,6 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Исправляем старые записи, где plays мог быть NULL.
-        await conn.execute(
-            "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS plays INTEGER DEFAULT 0"
-        )
-        await conn.execute("UPDATE tracks SET plays = 0 WHERE plays IS NULL")
-        await conn.execute("ALTER TABLE tracks ALTER COLUMN plays SET DEFAULT 0")
-        await conn.execute("ALTER TABLE tracks ALTER COLUMN plays SET NOT NULL")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS favorites (
                 user_id BIGINT NOT NULL,
@@ -385,133 +138,11 @@ async def init_db():
                 FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE
             )
         """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                is_active BOOLEAN DEFAULT TRUE,
-                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS request_sessions (
-                id SERIAL PRIMARY KEY,
-                channel_chat_id BIGINT,
-                channel_message_id BIGINT,
-                discussion_chat_id BIGINT,
-                discussion_thread_id BIGINT,
-                title TEXT,
-                status TEXT DEFAULT 'active',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS track_requests (
-                id SERIAL PRIMARY KEY,
-                session_id INTEGER NOT NULL,
-                user_id BIGINT,
-                username TEXT,
-                full_name TEXT,
-                text TEXT NOT NULL,
-                discussion_message_id BIGINT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(session_id) REFERENCES request_sessions(id) ON DELETE CASCADE
-            )
-        """)
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_req_sessions_active "
-            "ON request_sessions (status, created_at DESC)"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_req_sessions_thread "
-            "ON request_sessions (discussion_chat_id, discussion_thread_id)"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_track_requests_session "
-            "ON track_requests (session_id, created_at DESC)"
-        )
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS bot_settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS star_orders (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                username TEXT,
-                full_name TEXT,
-                amount_stars INTEGER NOT NULL,
-                price_total NUMERIC(12,2) NOT NULL,
-                status TEXT DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_star_orders_status "
-            "ON star_orders (status, created_at DESC)"
-        )
-        await conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_tracks_title_trgm ON tracks USING GIN (title gin_trgm_ops)"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_tracks_artist_trgm ON tracks USING GIN (artist gin_trgm_ops)"
-        )
-        await conn.execute(
-            "ALTER TABLE vote_sessions ADD COLUMN IF NOT EXISTS closes_at TIMESTAMP"
-        )
-        await conn.execute(
-            "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_tracks_plays ON tracks (plays DESC)"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_tracks_created_at ON tracks (created_at DESC)"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_tracks_artist ON tracks (artist)"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_favorites_user ON favorites (user_id, added_at DESC)"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_playlist_tracks_pl ON playlist_tracks (playlist_id, added_at DESC)"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_votes_session ON votes (session_id, user_id)"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_vote_sessions_active ON vote_sessions (status, vote_type, created_at DESC)"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_users_active ON users (is_active) WHERE is_active = TRUE"
-        )
         logging.info("✅ База данных инициализирована")
 
 # --- СОСТОЯНИЯ ---
 class PlaylistForm(StatesGroup):
     waiting_name = State()
-
-class BroadcastForm(StatesGroup):
-    waiting_text = State()
-
-class DonateForm(StatesGroup):
-    waiting_amount = State()
-
-class RequestForm(StatesGroup):
-    waiting_text = State()
-
-class BuyStarsForm(StatesGroup):
-    waiting_amount = State()
-
-BOT_USERNAME = ""
 
 # --- КОНСТАНТЫ ---
 PAGE_SIZE = 10
@@ -522,9 +153,8 @@ MAX_PLAYLISTS = 5
 # --- КЛАВИАТУРЫ ---
 menu = ReplyKeyboardMarkup(keyboard=[
     [KeyboardButton(text="🔍 Поиск"), KeyboardButton(text="🎲 Случайный")],
-    [KeyboardButton(text="🔥 Топ"), KeyboardButton(text="🆕 Новое")],
-    [KeyboardButton(text="❤️ Избранное"), KeyboardButton(text="📋 Список Плейлистов")],
-    [KeyboardButton(text="💝 Донат")],
+    [KeyboardButton(text="🔥 Топ"), KeyboardButton(text="❤️ Избранное")],
+    [KeyboardButton(text="📋 Список Плейлистов")],
 ], resize_keyboard=True)
 
 def clean_artist(a):
@@ -553,6 +183,34 @@ async def track_keyboard(tid, uid):
         [InlineKeyboardButton(text="➕ В плейлист", callback_data=f"topl_{tid}")],
         [InlineKeyboardButton(text="🎵 Похожие", callback_data=f"rec_{tid}")]
     ])
+
+async def playlist_picker_keyboard(tid, uid):
+    """Клавиатура выбора плейлиста с переключением состояния трека."""
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        playlists = await conn.fetch(
+            "SELECT p.id, p.name, EXISTS("
+            "SELECT 1 FROM playlist_tracks pt "
+            "WHERE pt.playlist_id=p.id AND pt.track_id=$2"
+            ") AS contains_track "
+            "FROM playlists p WHERE p.user_id=$1 ORDER BY p.created_at, p.id",
+            uid, tid
+        )
+
+    rows = [
+        [InlineKeyboardButton(
+            text=f"{'✅' if p['contains_track'] else '➕'} {p['name']}",
+            callback_data=f"apl_{p['id']}_{tid}"
+        )]
+        for p in playlists
+    ]
+    rows.append([
+        InlineKeyboardButton(
+            text="➕ Создать плейлист",
+            callback_data=f"plnewt_{tid}"
+        )
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 # --- ПОИСК И ТРАНСЛИТЕРАЦИЯ ---
 CYR_LAT = {
@@ -613,62 +271,48 @@ def get_var(q):
         if cyr and cyr != q: v.append(cyr)
     return v
 
-def _esc_like(s: str) -> str:
-    """Экранирует спецсимволы LIKE/ILIKE."""
-    return s.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+def _search_conditions(var):
+    conditions, params, p = [], [], 1
+    for v in var:
+        conditions.append(f"title ILIKE ${p}")
+        params.append(f"%{v}%")
+        p += 1
+        conditions.append(f"artist ILIKE ${p}")
+        params.append(f"%{v}%")
+        p += 1
+    return conditions, params, p
 
-def _search_query_parts(variants):
-    """Собирает части SQL для поиска по треку/артисту с ранжированием.
-    Возвращает (where_expr, score_expr, params, next_param_index).
-    На каждый вариант запроса генерирует 3 параметра (exact, prefix, substring)
-    и оценивает релевантность: точное совпадение > префикс > подстрока,
-    название важнее исполнителя.
-    """
-    where = []
-    score_terms = []
-    params = []
-    p = 1
-    for v in variants:
-        v_esc = _esc_like(v)
-        params.extend([v_esc, v_esc + '%', '%' + v_esc + '%'])
-        i_exact, i_prefix, i_substr = p, p + 1, p + 2
-        p += 3
-        where.append(f"title ILIKE ${i_substr}")
-        where.append(f"artist ILIKE ${i_substr}")
-        score_terms.append(
-            f"(CASE WHEN title  ILIKE ${i_exact}  THEN 100 ELSE 0 END"
-            f" + CASE WHEN artist ILIKE ${i_exact}  THEN 80  ELSE 0 END"
-            f" + CASE WHEN title  ILIKE ${i_prefix} THEN 30  ELSE 0 END"
-            f" + CASE WHEN artist ILIKE ${i_prefix} THEN 25  ELSE 0 END"
-            f" + CASE WHEN title  ILIKE ${i_substr} THEN 5   ELSE 0 END"
-            f" + CASE WHEN artist ILIKE ${i_substr} THEN 4   ELSE 0 END)"
-        )
-    where_expr = ' OR '.join(where) if where else 'FALSE'
-    score_expr = ' + '.join(score_terms) if score_terms else '0'
-    return where_expr, score_expr, params, p
+async def count_search(query) -> int:
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        var = get_var(query)
+        if not var: return 0
+        try:
+            conditions, params, _ = _search_conditions(var)
+            sql = f"SELECT COUNT(*) FROM (SELECT DISTINCT id FROM tracks WHERE {' OR '.join(conditions)}) t"
+            return await conn.fetchval(sql, *params)
+        except Exception as e:
+            logging.error(f"❌ Ошибка count_search: {e}")
+    return 0
 
 async def run_search(query, offset=0):
-    async with db_pool.acquire() as conn:
+    pool = await get_db()
+    async with pool.acquire() as conn:
         var = get_var(query)
-        if not var:
-            return [], 0
+        if not var: return []
         try:
-            where_expr, score_expr, params, p = _search_query_parts(var)
+            conditions, params, p = _search_conditions(var)
             sql = (
-                f"SELECT id, title, artist, COUNT(*) OVER() AS total "
-                f"FROM (SELECT id, title, artist, plays, "
-                f"             ({score_expr}) AS score "
-                f"      FROM tracks WHERE {where_expr}) sub "
-                f"ORDER BY score DESC, plays DESC, id DESC "
+                f"SELECT DISTINCT id, title, artist FROM tracks "
+                f"WHERE {' OR '.join(conditions)} "
+                f"ORDER BY id "
                 f"LIMIT ${p} OFFSET ${p+1}"
             )
             params.extend([PAGE_SIZE, offset])
-            rows = await conn.fetch(sql, *params)
-            total = rows[0]['total'] if rows else 0
-            return rows, int(total)
+            return await conn.fetch(sql, *params)
         except Exception as e:
             logging.error(f"❌ Ошибка поиска: {e}")
-    return [], 0
+    return []
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ПАГИНАЦИИ ---
 
@@ -718,7 +362,6 @@ async def show_fav_page(user_id: int, page: int, target, edit: bool = False):
     if page < total_pages - 1:
         nav.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"favp_{page + 1}"))
     rows = play_rows + unfav_rows
-    rows.append([InlineKeyboardButton(text="🎲 Случайный из избранного", callback_data="rnd_fav")])
     if nav:
         rows.append(nav)
     if total_pages > 1:
@@ -784,7 +427,6 @@ async def show_playlist_page(pid: int, user_id: int, page: int, target, edit: bo
     if page < total_pages - 1:
         nav.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"oplp_{pid}_{page + 1}"))
     rows = play_rows + rm_rows
-    rows.append([InlineKeyboardButton(text="🎲 Случайный из плейлиста", callback_data=f"rnd_pl_{pid}")])
     if nav:
         rows.append(nav)
     if total_pages > 1:
@@ -800,129 +442,25 @@ async def show_playlist_page(pid: int, user_id: int, page: int, target, edit: bo
 
 # --- ХЭНДЛЕРЫ ---
 
-@dp.callback_query(F.data == "check_sub")
-async def check_sub_cb(cb: types.CallbackQuery):
-    """Кнопка «Я подписался» — повторная проверка подписки."""
-    SUB_CACHE.pop(cb.from_user.id, None)
-    if await is_subscribed(cb.from_user.id):
-        try:
-            await cb.answer("✅ Подписка подтверждена!", show_alert=False)
-        except Exception:
-            pass
-        try:
-            if cb.message:
-                await cb.message.edit_text(
-                    "✅ Подписка подтверждена. Жми /start, чтобы начать пользоваться ботом."
-                )
-        except Exception:
-            try:
-                if cb.message:
-                    await cb.message.answer(
-                        "✅ Подписка подтверждена. Жми /start, чтобы начать."
-                    )
-            except Exception:
-                pass
-    else:
-        try:
-            await cb.answer(
-                "❌ Подписка не найдена. Подпишись на канал и нажми кнопку ещё раз.",
-                show_alert=True
-            )
-        except Exception:
-            pass
-
 @dp.message(Command("start"))
 async def start_cmd(m: types.Message, state: FSMContext):
     await state.clear()
-    parts = m.text.split(maxsplit=1)
-    payload = parts[1].strip() if len(parts) > 1 else ""
-    if payload.startswith("req_"):
-        try:
-            sid = int(payload[4:])
-        except ValueError:
-            sid = None
-        if sid:
-            async with db_pool.acquire() as conn:
-                session = await conn.fetchrow(
-                    "SELECT id, status FROM request_sessions WHERE id=$1", sid
-                )
-            if not session or session['status'] != 'active':
-                await m.answer(
-                    "❌ Сбор заявок уже закрыт. Следи за каналом — будет новый пост.",
-                    reply_markup=menu
-                )
-                return
-            await state.set_state(RequestForm.waiting_text)
-            await state.update_data(session_id=sid)
-            await m.answer(
-                "📝 Напиши <b>одним сообщением</b> исполнителя и название трека, "
-                "который хочешь следующим.\n\nНапример: <code>Eminem — Mockingbird</code>\n\n"
-                "Отменить — /cancel",
-                parse_mode="HTML"
-            )
-            return
     await m.answer("🎧 Бот запущен", reply_markup=menu)
-
-@dp.message(RequestForm.waiting_text, F.text & ~F.text.startswith("/"))
-async def request_text_handler(m: types.Message, state: FSMContext):
-    text = (m.text or "").strip()
-    if not text:
-        await m.answer("❌ Пусто. Напиши название трека или /cancel")
-        return
-    if len(text) > 500:
-        text = text[:500]
-    data = await state.get_data()
-    sid = data.get("session_id")
-    if not sid:
-        await state.clear()
-        await m.answer("❌ Сессия потеряна. Попробуй снова через пост в канале.")
-        return
-    async with db_pool.acquire() as conn:
-        session = await conn.fetchrow(
-            "SELECT id, status FROM request_sessions WHERE id=$1", sid
-        )
-        if not session or session['status'] != 'active':
-            await state.clear()
-            await m.answer("❌ Сбор заявок уже закрыт.")
-            return
-        err_code, err_text = await _request_limit_status(conn, sid, m.from_user.id)
-        if err_code:
-            await state.clear()
-            await m.answer(err_text, reply_markup=menu)
-            return
-        await conn.execute(
-            "INSERT INTO track_requests "
-            "(session_id, user_id, username, full_name, text) "
-            "VALUES ($1, $2, $3, $4, $5)",
-            sid,
-            m.from_user.id,
-            m.from_user.username,
-            m.from_user.full_name,
-            text
-        )
-    await state.clear()
-    await m.answer("✅ Заявка принята, спасибо!", reply_markup=menu)
 
 @dp.channel_post(F.audio)
 async def save_track(m: types.Message):
     t = m.audio.title or "Unknown"
     a = m.audio.performer or "Unknown"
     f = m.audio.file_id
-    try:
-        async with db_pool.acquire() as conn:
-            result = await conn.execute(
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        try:
+            await conn.execute(
                 "INSERT INTO tracks (title, artist, file_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
                 t, a, f
             )
-        if result == "INSERT 0 1" and ADMIN_ID:
-            track_name = html.escape(format_track(a, t))
-            await bot.send_message(
-                ADMIN_ID,
-                f"🎵 Новый трек из канала:\n<b>{track_name}</b>",
-                parse_mode="HTML"
-            )
-    except Exception as e:
-        logging.error(f"Ошибка сохранения трека: {e}")
+        except Exception as e:
+            logging.error(f"Ошибка сохранения трека: {e}")
 
 @dp.message(F.audio)
 async def imp_track(m: types.Message):
@@ -941,75 +479,21 @@ async def imp_track(m: types.Message):
         except Exception as e:
             logging.error(f"Ошибка импорта трека: {e}")
 
-async def _send_random_track(target, user_id: int, query: str = ""):
-    """Отправить случайный трек. query — SQL WHERE-условие (без WHERE)."""
-    try:
-        async with db_pool.acquire() as conn:
-            bounds = await conn.fetchrow(
-                f"SELECT MIN(id) AS mn, MAX(id) AS mx FROM tracks{' WHERE ' + query if query else ''}"
-            )
-            if not bounds or bounds['mx'] is None:
-                text = "❌ База пуста" if not query else "❌ Нет треков"
-                if isinstance(target, types.Message):
-                    await target.answer(text)
-                else:
-                    await target.answer(text, show_alert=True)
-                return
-            rand_id = random.randint(bounds['mn'], bounds['mx'])
-            sql = f"SELECT id, file_id FROM tracks WHERE id >= $1{' AND ' + query if query else ''} ORDER BY id LIMIT 1"
-            r = await conn.fetchrow(sql, rand_id)
-            if not r:
-                sql_fallback = f"SELECT id, file_id FROM tracks{' WHERE ' + query if query else ''} ORDER BY id LIMIT 1"
-                r = await conn.fetchrow(sql_fallback)
-            if not r:
-                if isinstance(target, types.Message):
-                    await target.answer("❌ Нет треков")
-                else:
-                    await target.answer("❌ Нет треков", show_alert=True)
-                return
-        await _send_track_audio(target, r['id'], user_id, r['file_id'])
-        if isinstance(target, types.Message):
-            await target.answer_audio(r['file_id'], reply_markup=kb)
-        else:
-            await target.message.answer_audio(r['file_id'], reply_markup=kb)
-            await target.answer()
-    except Exception as e:
-        logging.error(f"Ошибка в _send_random_track: {e}")
-
-async def _send_track_audio(target, track_id: int, user_id: int, file_id: str = None):
-    """Отправить трек и засчитать прослушивание только после успешной отправки."""
-    if file_id is None:
-        async with db_pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT id, file_id FROM tracks WHERE id=$1", track_id
-            )
-        if not row:
-            if isinstance(target, types.Message):
-                await target.answer("❌ Трек не найден")
-            else:
-                await target.answer("❌ Трек не найден", show_alert=True)
-            return False
-        file_id = row["file_id"]
-
-    kb = await track_keyboard(track_id, user_id)
-    if isinstance(target, types.Message):
-        await target.answer_audio(file_id, reply_markup=kb)
-    else:
-        await target.message.answer_audio(file_id, reply_markup=kb)
-        await target.answer()
-
-    async with db_pool.acquire() as conn:
-        updated = await conn.execute(
-            "UPDATE tracks SET plays=COALESCE(plays, 0)+1 WHERE id=$1",
-            track_id
-        )
-    if updated != "UPDATE 1":
-        logging.warning("Не удалось засчитать прослушивание трека id=%s", track_id)
-        return False
-    return True
 @dp.message(F.text == "🎲 Случайный")
 async def rnd(m: types.Message):
-    await _send_random_track(m, m.from_user.id)
+    pool = await get_db()
+    try:
+        async with pool.acquire() as conn:
+            count = await conn.fetchval("SELECT COUNT(*) FROM tracks")
+            if count == 0:
+                await m.answer("❌ База пуста")
+                return
+            offset = random.randint(0, count - 1)
+            r = await conn.fetchrow("SELECT id, file_id FROM tracks LIMIT 1 OFFSET $1", offset)
+            await conn.execute("UPDATE tracks SET plays=plays+1 WHERE id=$1", r['id'])
+        await m.answer_audio(r['file_id'], reply_markup=await track_keyboard(r['id'], m.from_user.id))
+    except Exception as e:
+        logging.error(f"Ошибка в rnd: {e}")
 
 @dp.message(F.text == "🔍 Поиск")
 async def sb(m: types.Message, state: FSMContext):
@@ -1038,11 +522,7 @@ async def top(m: types.Message):
     pool = await get_db()
     try:
         async with pool.acquire() as conn:
-            res = await conn.fetch(
-                "SELECT id, artist, title, COALESCE(plays, 0) AS plays "
-                "FROM tracks "
-                "ORDER BY COALESCE(plays, 0) DESC, id ASC LIMIT 10"
-            )
+            res = await conn.fetch("SELECT artist, title, plays FROM tracks ORDER BY plays DESC LIMIT 10")
         if not res:
             await m.answer("❌ Пусто")
             return
@@ -1055,70 +535,6 @@ async def top(m: types.Message):
     except Exception as e:
         logging.error(f"Ошибка в top: {e}")
 
-@dp.message(F.text == "🆕 Новое")
-async def new_tracks(m: types.Message):
-    try:
-        async with db_pool.acquire() as conn:
-            res = await conn.fetch(
-                "SELECT id, title, artist, created_at FROM tracks ORDER BY created_at DESC LIMIT 10"
-            )
-        if not res:
-            await m.answer("❌ Пусто")
-            return
-        lines = [
-            f"{i}. {html.escape(format_track(r['artist'], r['title']))} — <i>{r['created_at'].strftime('%d.%m.%Y')}</i>"
-            for i, r in enumerate(res, 1)
-        ]
-        ids = [r['id'] for r in res]
-        kb_rows = num_buttons(ids)
-        kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
-        await m.answer("🆕 <b>Новинки:</b>\n\n" + "\n".join(lines), reply_markup=kb, parse_mode="HTML")
-    except Exception as e:
-        logging.error(f"Ошибка в new_tracks: {e}")
-
-@dp.callback_query(F.data == "rnd_fav")
-async def rnd_fav_cb(c: types.CallbackQuery):
-    try:
-        async with db_pool.acquire() as conn:
-            track_ids = await conn.fetch(
-                "SELECT track_id FROM favorites WHERE user_id=$1", c.from_user.id
-            )
-        if not track_ids:
-            await c.answer("❌ Избранное пусто", show_alert=True)
-            return
-        ids = [r['track_id'] for r in track_ids]
-        chosen = random.choice(ids)
-        await _send_track_audio(c, chosen, c.from_user.id)
-
-    except Exception as e:
-        logging.error(f"Ошибка в rnd_fav_cb: {e}")
-        await c.answer("❌ Ошибка", show_alert=True)
-
-@dp.callback_query(F.data.startswith("rnd_pl_"))
-async def rnd_pl_cb(c: types.CallbackQuery):
-    try:
-        pid = int(c.data.split("_")[2])
-        async with db_pool.acquire() as conn:
-            pl = await conn.fetchrow(
-                "SELECT id FROM playlists WHERE id=$1 AND user_id=$2", pid, c.from_user.id
-            )
-            if not pl:
-                await c.answer("❌", show_alert=True)
-                return
-            track_ids = await conn.fetch(
-                "SELECT track_id FROM playlist_tracks WHERE playlist_id=$1", pid
-            )
-        if not track_ids:
-            await c.answer("❌ Плейлист пуст", show_alert=True)
-            return
-        ids = [r['track_id'] for r in track_ids]
-        chosen = random.choice(ids)
-        await _send_track_audio(c, chosen, c.from_user.id)
-
-    except Exception as e:
-        logging.error(f"Ошибка в rnd_pl_cb: {e}")
-        await c.answer("❌ Ошибка", show_alert=True)
-
 @dp.message(F.text == "📋 Список Плейлистов")
 async def spl(m: types.Message, state: FSMContext):
     await state.clear()
@@ -1129,7 +545,7 @@ async def spl(m: types.Message, state: FSMContext):
         count = len(res)
         rows = [
             [
-                InlineKeyboardButton(text=f"📋 {p['name']}", callback_data=f"opl_{p['id']}"),
+                InlineKeyboardButton(text=f"📋 {html.escape(p['name'])}", callback_data=f"opl_{p['id']}"),
                 InlineKeyboardButton(text="🗑", callback_data=f"delpl_{p['id']}")
             ]
             for p in res
@@ -1149,6 +565,7 @@ async def spl(m: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "plnew")
 async def cpn(c: types.CallbackQuery, state: FSMContext):
     await state.set_state(PlaylistForm.waiting_name)
+    await state.update_data(pending_track_id=None)
     await c.message.answer("✏️ Название:")
     await c.answer()
 
@@ -1158,6 +575,8 @@ async def rpn(m: types.Message, state: FSMContext):
     if not n or len(n) > 50:
         await m.answer("❌ От 1 до 50 симв.")
         return
+    form_data = await state.get_data()
+    pending_track_id = form_data.get("pending_track_id")
     pool = await get_db()
     try:
         async with pool.acquire() as conn:
@@ -1168,9 +587,21 @@ async def rpn(m: types.Message, state: FSMContext):
                 await state.clear()
                 await m.answer(f"❌ Максимум {MAX_PLAYLISTS} плейлистов. Удали один перед созданием нового.")
                 return
-            await conn.execute("INSERT INTO playlists (user_id, name) VALUES ($1, $2)", m.from_user.id, n)
+            playlist_id = await conn.fetchval(
+                "INSERT INTO playlists (user_id, name) VALUES ($1, $2) RETURNING id",
+                m.from_user.id, n
+            )
+            if pending_track_id is not None:
+                await conn.execute(
+                    "INSERT INTO playlist_tracks (playlist_id, track_id) "
+                    "VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                    playlist_id, pending_track_id
+                )
         await state.clear()
-        await m.answer(f"✅ «{html.escape(n)}» создан!")
+        if pending_track_id is not None:
+            await m.answer(f"✅ «{html.escape(n)}» создан, трек добавлен!")
+        else:
+            await m.answer(f"✅ «{html.escape(n)}» создан!")
     except Exception as e:
         logging.error(f"Ошибка в rpn: {e}")
 
@@ -1211,23 +642,38 @@ async def oplp(c: types.CallbackQuery):
         await c.answer("❌ Ошибка", show_alert=True)
 
 @dp.callback_query(F.data.startswith("topl_"))
-async def cpl(c: types.CallbackQuery):
+async def cpl(c: types.CallbackQuery, state: FSMContext):
     try:
         tid = int(c.data.split("_")[1])
         pool = await get_db()
         async with pool.acquire() as conn:
             pls = await conn.fetch("SELECT id, name FROM playlists WHERE user_id=$1", c.from_user.id)
         if not pls:
-            await c.answer("Сначала создай плейлист", show_alert=True)
+            await state.set_state(PlaylistForm.waiting_name)
+            await state.update_data(pending_track_id=tid)
+            await c.message.answer("✏️ У тебя пока нет плейлистов. Введи название нового плейлиста:")
+            await c.answer()
             return
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"📋 {p['name']}", callback_data=f"apl_{p['id']}_{tid}")]
-            for p in pls
-        ])
-        await c.message.answer("Выбери:", reply_markup=kb)
+        await c.message.answer(
+            "📋 Выбери плейлист.\n"
+            "✅ — трек уже добавлен, повторное нажатие уберёт его.",
+            reply_markup=await playlist_picker_keyboard(tid, c.from_user.id)
+        )
         await c.answer()
     except Exception as e:
         logging.error(f"Ошибка в cpl: {e}")
+
+@dp.callback_query(F.data.startswith("plnewt_"))
+async def create_playlist_for_track(c: types.CallbackQuery, state: FSMContext):
+    try:
+        tid = int(c.data.split("_")[1])
+        await state.set_state(PlaylistForm.waiting_name)
+        await state.update_data(pending_track_id=tid)
+        await c.message.answer("✏️ Введи название нового плейлиста:")
+        await c.answer()
+    except Exception as e:
+        logging.error(f"Ошибка в create_playlist_for_track: {e}")
+        await c.answer("❌ Ошибка", show_alert=True)
 
 @dp.callback_query(F.data.startswith("apl_"))
 async def apl(c: types.CallbackQuery):
@@ -1236,13 +682,36 @@ async def apl(c: types.CallbackQuery):
         pid, tid = int(p[1]), int(p[2])
         pool = await get_db()
         async with pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO playlist_tracks (playlist_id, track_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            owns_playlist = await conn.fetchval(
+                "SELECT 1 FROM playlists WHERE id=$1 AND user_id=$2",
+                pid, c.from_user.id
+            )
+            if not owns_playlist:
+                await c.answer("❌ Плейлист не найден", show_alert=True)
+                return
+            already_added = await conn.fetchval(
+                "SELECT 1 FROM playlist_tracks WHERE playlist_id=$1 AND track_id=$2",
                 pid, tid
             )
-        await c.answer("✅ Добавлено", show_alert=True)
-        try: await c.message.delete()
-        except: pass
+            if already_added:
+                await conn.execute(
+                    "DELETE FROM playlist_tracks WHERE playlist_id=$1 AND track_id=$2",
+                    pid, tid
+                )
+                message = "💔 Убрано из плейлиста"
+            else:
+                await conn.execute(
+                    "INSERT INTO playlist_tracks (playlist_id, track_id) VALUES ($1, $2)",
+                    pid, tid
+                )
+                message = "✅ Добавлено в плейлист"
+        await c.answer(message, show_alert=True)
+        try:
+            await c.message.edit_reply_markup(
+                reply_markup=await playlist_picker_keyboard(tid, c.from_user.id)
+            )
+        except Exception:
+            pass
     except Exception as e:
         logging.error(f"Ошибка в apl: {e}")
 
@@ -1267,7 +736,15 @@ async def rmpl(c: types.CallbackQuery):
 async def st(c: types.CallbackQuery):
     try:
         tid = int(c.data.split("_")[1])
-        await _send_track_audio(c, tid, c.from_user.id)
+        pool = await get_db()
+        async with pool.acquire() as conn:
+            r = await conn.fetchrow("SELECT id, file_id FROM tracks WHERE id=$1", tid)
+            if not r:
+                await c.answer("❌ Трек не найден", show_alert=True)
+                return
+            await conn.execute("UPDATE tracks SET plays=plays+1 WHERE id=$1", tid)
+        await c.message.answer_audio(r['file_id'], reply_markup=await track_keyboard(tid, c.from_user.id))
+        await c.answer()
     except Exception as e:
         logging.error(f"Ошибка в st: {e}")
 
@@ -1385,81 +862,6 @@ async def rec_cmd(c: types.CallbackQuery):
         logging.error(f"Ошибка в rec_cmd: {e}")
         await c.answer("❌ Ошибка", show_alert=True)
 
-@dp.message(Command("cancel"))
-async def cancel_cmd(m: types.Message, state: FSMContext):
-    cur = await state.get_state()
-    if cur:
-        await state.clear()
-        await m.answer("❌ Отменено", reply_markup=menu)
-    else:
-        await m.answer("Нечего отменять", reply_markup=menu)
-
-# --- ДОНАТ (Telegram Stars) ---
-DONATE_MIN = 1
-DONATE_MAX = 100000
-
-@dp.message(F.text == "💝 Донат")
-async def donate_start(m: types.Message, state: FSMContext):
-    await state.set_state(DonateForm.waiting_amount)
-    await m.answer(
-        "💝 <b>Поддержать бота</b>\n\n"
-        "Спасибо, что хочешь помочь! 🙏\n"
-        f"Введи сумму в Telegram Stars ⭐️ (от {DONATE_MIN} до {DONATE_MAX}).\n\n"
-        "Для отмены: /cancel",
-        parse_mode="HTML",
-    )
-
-@dp.message(DonateForm.waiting_amount)
-async def donate_amount(m: types.Message, state: FSMContext):
-    txt = (m.text or "").strip()
-    if not txt.isdigit():
-        await m.answer("❌ Введи целое число звёзд, например: <code>50</code>", parse_mode="HTML")
-        return
-    amount = int(txt)
-    if amount < DONATE_MIN or amount > DONATE_MAX:
-        await m.answer(f"❌ Сумма должна быть от {DONATE_MIN} до {DONATE_MAX} ⭐️")
-        return
-    await state.clear()
-    try:
-        await bot.send_invoice(
-            chat_id=m.chat.id,
-            title="Поддержка бота",
-            description=f"Донат {amount} ⭐️ на развитие бота",
-            payload=f"donate:{m.from_user.id}:{amount}",
-            currency="XTR",
-            prices=[LabeledPrice(label=f"Донат {amount} ⭐️", amount=amount)],
-        )
-    except Exception as e:
-        logging.error(f"Ошибка отправки счёта: {e}")
-        await m.answer("❌ Не удалось создать счёт. Попробуй позже.")
-
-@dp.pre_checkout_query()
-async def pre_checkout(q: PreCheckoutQuery):
-    try:
-        await bot.answer_pre_checkout_query(q.id, ok=True)
-    except Exception as e:
-        logging.error(f"Ошибка pre_checkout: {e}")
-
-@dp.message(F.successful_payment)
-async def on_payment(m: types.Message):
-    sp = m.successful_payment
-    amount = sp.total_amount
-    await m.answer(
-        f"💖 <b>Спасибо за поддержку!</b>\n\nТы задонатил <b>{amount} ⭐️</b>. Это очень помогает!",
-        parse_mode="HTML",
-        reply_markup=menu
-    )
-    if ADMIN_ID and m.from_user.id != ADMIN_ID:
-        try:
-            uname = f"@{m.from_user.username}" if m.from_user.username else m.from_user.full_name
-            await bot.send_message(
-                ADMIN_ID,
-                f"💝 Новый донат: <b>{amount} ⭐️</b>\nОт: {html.escape(uname)} (id <code>{m.from_user.id}</code>)",
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            logging.error(f"Не удалось уведомить админа о донате: {e}")
-
 @dp.message(Command("stats"))
 async def stats_cmd(m: types.Message):
     if m.from_user.id != ADMIN_ID: return
@@ -1470,111 +872,13 @@ async def stats_cmd(m: types.Message):
             tp = await conn.fetchval("SELECT COALESCE(SUM(plays),0) FROM tracks")
             fc = await conn.fetchval("SELECT COUNT(*) FROM favorites")
             pc = await conn.fetchval("SELECT COUNT(*) FROM playlists")
-            uc = await conn.fetchval("SELECT COUNT(*) FROM users WHERE is_active = TRUE")
         await m.answer(
             f"📊 <b>Статистика</b>\n\n"
-            f"Треков: {tc}\nПрослушиваний: {tp}\nИзбранных: {fc}\nПлейлистов: {pc}\n"
-            f"Пользователей: {uc}",
+            f"Треков: {tc}\nПрослушиваний: {tp}\nИзбранных: {fc}\nПлейлистов: {pc}",
             parse_mode="HTML"
         )
     except Exception as e:
         logging.error(f"Ошибка в stats: {e}")
-
-@dp.message(Command("topusers"))
-async def topusers_cmd(m: types.Message):
-    if m.from_user.id != ADMIN_ID: return
-    try:
-        async with db_pool.acquire() as conn:
-            res = await conn.fetch("""
-                SELECT u.user_id, u.first_name, u.username,
-                       COUNT(DISTINCT f.track_id) AS fav_count,
-                       COUNT(DISTINCT p.id) AS pl_count,
-                       u.last_seen
-                FROM users u
-                LEFT JOIN favorites f ON f.user_id = u.user_id
-                LEFT JOIN playlists p ON p.user_id = u.user_id
-                WHERE u.is_active = TRUE
-                GROUP BY u.user_id, u.first_name, u.username, u.last_seen
-                ORDER BY fav_count DESC
-                LIMIT 15
-            """)
-        if not res:
-            await m.answer("❌ Нет пользователей")
-            return
-        lines = []
-        for i, r in enumerate(res, 1):
-            name = html.escape(r['first_name'] or "")
-            uname = f" (@{r['username']})" if r['username'] else ""
-            seen = r['last_seen'].strftime('%d.%m.%y') if r['last_seen'] else "—"
-            lines.append(
-                f"{i}. <b>{name}</b>{html.escape(uname)}\n"
-                f"   ❤️ {r['fav_count']} • 📋 {r['pl_count']} • 🕐 {seen}"
-            )
-        await m.answer("👥 <b>Топ пользователей по избранному:</b>\n\n" + "\n\n".join(lines), parse_mode="HTML")
-    except Exception as e:
-        logging.error(f"Ошибка в topusers_cmd: {e}")
-
-@dp.message(Command("broadcast"))
-async def broadcast_cmd(m: types.Message, state: FSMContext):
-    if m.from_user.id != ADMIN_ID: return
-    try:
-        async with db_pool.acquire() as conn:
-            count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE is_active = TRUE")
-        await state.set_state(BroadcastForm.waiting_text)
-        await m.answer(
-            f"📢 <b>Рассылка</b>\n\n"
-            f"Активных пользователей: <b>{count}</b>\n\n"
-            f"Отправь сообщение для рассылки (текст, фото, аудио, видео, стикер).\n"
-            f"Для отмены: /cancel",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logging.error(f"Ошибка в broadcast_cmd: {e}")
-
-@dp.message(BroadcastForm.waiting_text)
-async def broadcast_send(m: types.Message, state: FSMContext):
-    await state.clear()
-    try:
-        async with db_pool.acquire() as conn:
-            users = await conn.fetch("SELECT user_id FROM users WHERE is_active = TRUE")
-        total = len(users)
-        if total == 0:
-            await m.answer("❌ Нет активных пользователей")
-            return
-        sent = 0
-        failed = 0
-        blocked = 0
-        status_msg = await m.answer(f"📤 Отправляю... 0/{total}")
-        for i, row in enumerate(users):
-            uid = row['user_id']
-            try:
-                await m.copy_to(uid)
-                sent += 1
-            except Exception as e:
-                err_text = str(e).lower()
-                if any(w in err_text for w in ("blocked", "deactivated", "not found", "forbidden", "chat not found")):
-                    blocked += 1
-                    async with db_pool.acquire() as conn:
-                        await conn.execute("UPDATE users SET is_active=FALSE WHERE user_id=$1", uid)
-                else:
-                    failed += 1
-            if (i + 1) % 25 == 0:
-                try:
-                    await status_msg.edit_text(f"📤 Отправляю... {i+1}/{total}")
-                except Exception:
-                    pass
-            await asyncio.sleep(0.05)
-        await status_msg.edit_text(
-            f"✅ <b>Рассылка завершена!</b>\n\n"
-            f"📤 Отправлено: {sent}\n"
-            f"🚫 Заблокировали бота: {blocked}\n"
-            f"❌ Другие ошибки: {failed}\n"
-            f"👥 Всего: {total}",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logging.error(f"Ошибка в broadcast_send: {e}")
-        await m.answer(f"❌ Ошибка рассылки: {e}")
 
 def build_search_keyboard(query: str, offset: int, total: int) -> InlineKeyboardMarkup:
     total_pages = math.ceil(total / PAGE_SIZE)
@@ -1591,17 +895,18 @@ def build_search_keyboard(query: str, offset: int, total: int) -> InlineKeyboard
     rows.append([InlineKeyboardButton(text=f"Страница {current_page} из {total_pages}", callback_data="noop")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-@dp.message(F.chat.type == "private", F.text & ~F.text.startswith("/") & ~F.text.in_({"🔍 Поиск","🎲 Случайный","🔥 Топ","🆕 Новое","❤️ Избранное","📋 Список Плейлистов","💝 Донат","⭐️ Купить Stars"}))
+@dp.message(F.text & ~F.text.startswith("/") & ~F.text.in_({"🔍 Поиск","🎲 Случайный","🔥 Топ","❤️ Избранное","📋 Список Плейлистов"}))
 async def search(m: types.Message, state: FSMContext):
     cur = await state.get_state()
-    if cur in (PlaylistForm.waiting_name, BroadcastForm.waiting_text, DonateForm.waiting_amount, RequestForm.waiting_text, BuyStarsForm.waiting_amount):
+    if cur == PlaylistForm.waiting_name:
         return
     q = m.text.strip()
     if not q: return
-    res, total = await run_search(q, offset=0)
+    total = await count_search(q)
     if total == 0:
         await m.answer("❌ Ничего не найдено")
         return
+    res = await run_search(q, offset=0)
     ids = [r['id'] for r in res]
     lines = [f"{i+1}. {html.escape(format_track(r['artist'], r['title']))}" for i, r in enumerate(res)]
     total_pages = math.ceil(total / PAGE_SIZE)
@@ -1623,10 +928,11 @@ async def page_nav(c: types.CallbackQuery):
         sep = raw.index(":")
         offset = int(raw[:sep])
         q = raw[sep+1:]
-        res, total = await run_search(q, offset=offset)
+        total = await count_search(q)
         if total == 0:
             await c.answer("❌ Ничего не найдено", show_alert=True)
             return
+        res = await run_search(q, offset=offset)
         if not res:
             await c.answer("❌ Страница не найдена", show_alert=True)
             return
@@ -1658,14 +964,8 @@ async def mg_cmd(m: types.Message):
                 if not var:
                     await m.answer("❌ Пустой запрос")
                     return
-                where_expr, score_expr, params, _ = _search_query_parts(var)
-                sql = (
-                    f"SELECT id, title, artist FROM ("
-                    f"  SELECT id, title, artist, plays, ({score_expr}) AS score "
-                    f"  FROM tracks WHERE {where_expr}"
-                    f") sub "
-                    f"ORDER BY score DESC, plays DESC, id DESC LIMIT 30"
-                )
+                conditions, params, p = _search_conditions(var)
+                sql = f"SELECT id, title, artist FROM tracks WHERE {' OR '.join(conditions)} ORDER BY id DESC LIMIT 30"
                 res = await conn.fetch(sql, *params)
                 header = f"🔍 По запросу «{html.escape(query)}»:"
             else:
@@ -1686,20 +986,12 @@ async def mg_cmd(m: types.Message):
 
 # --- ГОЛОСОВАНИЕ ---
 
-_MONTHS_RU = ["янв", "фев", "мар", "апр", "май", "июн",
-              "июл", "авг", "сен", "окт", "ноя", "дек"]
-
 def current_period(vote_type: str) -> str:
     today = datetime.date.today()
     if vote_type == 'day':
         return today.strftime("%d.%m.%Y")
-    weekday = today.weekday()
-    monday = today - datetime.timedelta(days=weekday)
-    sunday = monday + datetime.timedelta(days=6)
-    if monday.month == sunday.month:
-        return f"{monday.day}–{sunday.day} {_MONTHS_RU[monday.month - 1]} {sunday.year}"
-    return (f"{monday.day} {_MONTHS_RU[monday.month - 1]} – "
-            f"{sunday.day} {_MONTHS_RU[sunday.month - 1]} {sunday.year}")
+    iso = today.isocalendar()
+    return f"{iso[0]}-W{iso[1]:02d}"
 
 async def get_vote_counts(session_id: int):
     pool = await get_db()
@@ -1715,185 +1007,86 @@ async def get_vote_counts(session_id: int):
             ORDER BY vote_count DESC, vc.track_id
         """, session_id)
 
-def _split_period(period: str):
-    """Возвращает (date_part, artist_or_None). Период с артистом хранится как 'date|artist'."""
-    if period and '|' in period:
-        d, a = period.split('|', 1)
-        return d, a
-    return period, None
-
-def _vote_short_label(vote_type: str, period: str) -> str:
-    date_part, artist = _split_period(period)
+def build_vote_text(vote_type: str, period: str, rows, closed=False) -> str:
     if vote_type == 'day':
-        base = "Трек дня"
-    elif vote_type == 'week':
-        base = "Трек недели"
-    elif vote_type == 'artist':
-        return f"Лучшие треки {period}"
+        title = "🏆 Трек дня" if closed else "🗳 Голосование: Трек дня"
     else:
-        return vote_type
-    return f"{base} — {artist}" if artist else base
-
-def build_vote_text(vote_type: str, period: str, rows, closed=False, closes_at=None) -> str:
-    date_part, artist = _split_period(period)
-    if vote_type == 'artist':
-        title = f"Лучшие треки — {html.escape(period)}"
-        period_suffix = ""
-    else:
-        label = "дня" if vote_type == 'day' else "недели"
-        if artist:
-            title = f"Трек {label} — {html.escape(artist)}"
-        else:
-            title = f"Трек {label}"
-        period_suffix = f" • {date_part}"
-    if closed:
-        header = f"🏆 <b>Результаты голосования — {title}</b>"
-    else:
-        header = f"🗳 <b>Голосование — {title}</b>"
+        title = "🏆 Трек недели" if closed else "🗳 Голосование: Трек недели"
     total = sum(r['vote_count'] for r in rows)
     medals = ["🥇", "🥈", "🥉"]
     lines = []
     for i, r in enumerate(rows):
         pct = round(r['vote_count'] / total * 100) if total > 0 else 0
-        filled = round(pct / 10)
+        filled = pct // 10
         bar = "█" * filled + "░" * (10 - filled)
-        if closed and i == 0:
-            prefix = "🥇"
-        elif closed and i < 3:
-            prefix = medals[i]
-        else:
-            prefix = f"{i + 1}."
-        track_name = html.escape(format_track(r['artist'], r['title']))
-        count_str = f"{r['vote_count']} гол." if r['vote_count'] != 1 else "1 гол."
+        prefix = medals[i] if (closed and i < 3) else f"{i + 1}."
         lines.append(
-            f"{prefix} <b>{track_name}</b>\n"
-            f"<code>{bar}</code> {count_str} ({pct}%)"
+            f"{prefix} {html.escape(format_track(r['artist'], r['title']))}\n"
+            f"    {bar} {r['vote_count']} гол. ({pct}%)"
         )
-    if closed:
-        footer_parts = [f"📊 Всего проголосовало: <b>{total}</b>"]
-        if rows:
-            winner = html.escape(format_track(rows[0]['artist'], rows[0]['title']))
-            footer_parts.append(f"🏅 Победитель: <b>{winner}</b>")
-        footer = "\n".join(footer_parts)
-    else:
-        footer_parts = [f"👥 Проголосовало: <b>{total}</b>"]
-        if closes_at:
-            now = datetime.datetime.utcnow()
-            delta = closes_at - now
-            if delta.total_seconds() > 0:
-                h = int(delta.total_seconds() // 3600)
-                mn = int((delta.total_seconds() % 3600) // 60)
-                footer_parts.append(f"⏰ Закроется через: {h}ч {mn}мин")
-        footer_parts.append("👇🏼 Нажми на кнопку ниже чтобы проголосовать • 1 голос")
-        footer = "\n".join(footer_parts)
-    return f"{header}{period_suffix}\n\n" + "\n\n".join(lines) + f"\n\n{footer}"
+    footer = (
+        f"\n\nВсего голосов: <b>{total}</b>"
+        if closed else
+        "\n\n👆 Нажми на трек чтобы проголосовать • 1 голос на человека"
+    )
+    return f"<b>{title}</b> — {period}\n\n" + "\n\n".join(lines) + footer
 
-def build_vote_keyboard(session_id: int, rows, closed=False) -> InlineKeyboardMarkup:
-    if closed:
-        return InlineKeyboardMarkup(inline_keyboard=[])
-    medals = ["🥇", "🥈", "🥉"]
-    total = sum(r['vote_count'] for r in rows)
-    buttons = []
-    for i, r in enumerate(rows):
-        pct = round(r['vote_count'] / total * 100) if total > 0 else 0
-        prefix = medals[i] if i < 3 else f"{i + 1}."
-        name = format_track(r['artist'], r['title'])[:30]
-        label = f"{prefix} {name} — {r['vote_count']} ({pct}%)"
-        buttons.append([InlineKeyboardButton(
-            text=label,
+def build_vote_keyboard(session_id: int, rows) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(
+            text=f"{i + 1}. {html.escape(format_track(r['artist'], r['title']))[:35]}",
             callback_data=f"vote_{session_id}_{r['track_id']}"
-        )])
+        )]
+        for i, r in enumerate(rows)
+    ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-async def _start_vote(m: types.Message, vote_type: str, limit: int, hours: int = None, artist: str = None):
+async def _start_vote(m: types.Message, vote_type: str, limit: int):
     if m.from_user.id != ADMIN_ID: return
     channel_id = get_channel_id()
     if not channel_id:
         await m.answer("❌ CHANNEL_ID не задан в переменных окружения")
         return
-    date_period = current_period(vote_type)
-    canonical_artist = None
-    async with db_pool.acquire() as conn:
-        if artist:
-            cands = await _find_artist_candidates(conn, artist, limit=8)
-            if not cands:
-                await m.answer(f"❌ Исполнитель «{html.escape(artist)}» не найден в базе")
-                return
-            if len(cands) > 1 and not cands[0]['exact']:
-                await m.answer(_format_artist_candidates(cands, artist), parse_mode="HTML")
-                return
-            canonical_artist = cands[0]['artist']
-        period = f"{date_period}|{canonical_artist}" if canonical_artist else date_period
+    pool = await get_db()
+    period = current_period(vote_type)
+    async with pool.acquire() as conn:
         existing = await conn.fetchval(
-            "SELECT id FROM vote_sessions WHERE vote_type=$1 AND period=$2 AND status='active'",
-            vote_type, period
+            "SELECT id FROM vote_sessions WHERE vote_type=$1 AND period=$2", vote_type, period
         )
         if existing:
-            if canonical_artist:
-                await m.answer(f"⚠️ Голосование за {html.escape(canonical_artist)} ({date_period}) уже идёт")
-            else:
-                label = "сегодня" if vote_type == 'day' else "эту неделю"
-                await m.answer(f"⚠️ Голосование за {label} уже запущено")
+            label = "сегодня" if vote_type == 'day' else "эту неделю"
+            await m.answer(f"⚠️ Голосование за {label} уже запущено")
             return
-        if canonical_artist:
-            tracks = await _fetch_vote_tracks(conn, cands[0], limit)
-        else:
-            tracks = await conn.fetch(
-                "SELECT id, title, artist FROM tracks ORDER BY plays DESC LIMIT $1", limit
-            )
+        tracks = await conn.fetch(
+            "SELECT id, title, artist FROM tracks ORDER BY plays DESC LIMIT $1", limit
+        )
         if len(tracks) < 2:
-            who = f"у {html.escape(canonical_artist)}" if canonical_artist else "в базе"
-            await m.answer(f"❌ Мало треков {who} (нужно минимум 2)")
+            await m.answer("❌ Мало треков в базе (нужно минимум 2)")
             return
-        await conn.execute(
-            "DELETE FROM vote_sessions WHERE vote_type=$1 AND period=$2 AND status<>'active'",
+        session_id = await conn.fetchval(
+            "INSERT INTO vote_sessions (vote_type, period) VALUES ($1, $2) RETURNING id",
             vote_type, period
         )
-        closes_at = datetime.datetime.utcnow() + datetime.timedelta(hours=hours) if hours else None
-        session_id = await conn.fetchval(
-            "INSERT INTO vote_sessions (vote_type, period, closes_at) VALUES ($1, $2, $3) RETURNING id",
-            vote_type, period, closes_at
-        )
-        await conn.executemany(
-            "INSERT INTO vote_candidates (session_id, track_id) VALUES ($1, $2)",
-            [(session_id, t['id']) for t in tracks]
-        )
+        for t in tracks:
+            await conn.execute(
+                "INSERT INTO vote_candidates (session_id, track_id) VALUES ($1, $2)",
+                session_id, t['id']
+            )
     rows = await get_vote_counts(session_id)
-    text = build_vote_text(vote_type, period, rows, closes_at=closes_at)
+    text = build_vote_text(vote_type, period, rows)
     kb = build_vote_keyboard(session_id, rows)
     try:
         msg = await bot.send_message(channel_id, text, parse_mode="HTML", reply_markup=kb)
     except Exception as e:
         await m.answer(f"❌ Не удалось отправить в канал: {e}")
         return
-    async with db_pool.acquire() as conn:
+    async with pool.acquire() as conn:
         await conn.execute(
             "UPDATE vote_sessions SET channel_message_id=$1, channel_chat_id=$2 WHERE id=$3",
             msg.message_id, channel_id, session_id
         )
-    label_name = _vote_short_label(vote_type, period)
-    timer_info = f" Закроется через {hours}ч." if hours else ""
-    await m.answer(f"✅ Голосование «{html.escape(label_name)}» запущено! {len(tracks)} треков.{timer_info}", parse_mode="HTML")
-
-async def _do_close_vote(session: dict):
-    """Закрыть голосование по объекту сессии (используется вручную и авто-таймером)."""
-    async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE vote_sessions SET status='closed' WHERE id=$1", session['id'])
-    rows = await get_vote_counts(session['id'])
-    text = build_vote_text(session['vote_type'], session['period'], rows, closed=True)
-    kb = build_vote_keyboard(session['id'], rows, closed=True)
-    if session['channel_message_id'] and session['channel_chat_id']:
-        try:
-            await bot.edit_message_text(
-                text,
-                chat_id=session['channel_chat_id'],
-                message_id=session['channel_message_id'],
-                parse_mode="HTML",
-                reply_markup=kb
-            )
-        except Exception as e:
-            logging.warning(f"Не удалось обновить сообщение в канале: {e}")
-    return rows
+    label = "Трек дня" if vote_type == 'day' else "Трек недели"
+    await m.answer(f"✅ Голосование «{label}» запущено! {len(tracks)} треков в списке.")
 
 async def _close_vote(m: types.Message, vote_type: str):
     if m.from_user.id != ADMIN_ID: return
@@ -1907,7 +1100,19 @@ async def _close_vote(m: types.Message, vote_type: str):
         if not session:
             await m.answer("❌ Нет активного голосования")
             return
-    rows = await _do_close_vote(dict(session))
+        await conn.execute("UPDATE vote_sessions SET status='closed' WHERE id=$1", session['id'])
+    rows = await get_vote_counts(session['id'])
+    text = build_vote_text(vote_type, session['period'], rows, closed=True)
+    if session['channel_message_id'] and session['channel_chat_id']:
+        try:
+            await bot.edit_message_text(
+                text,
+                chat_id=session['channel_chat_id'],
+                message_id=session['channel_message_id'],
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logging.warning(f"Не удалось обновить сообщение в канале: {e}")
     if rows:
         winner = rows[0]
         total = sum(r['vote_count'] for r in rows)
@@ -1919,31 +1124,6 @@ async def _close_vote(m: types.Message, vote_type: str):
         )
     else:
         await m.answer("✅ Голосование закрыто. Голосов не было.")
-
-async def vote_auto_close_loop():
-    """Фоновая задача: автоматически закрывает голосования по истечении таймера."""
-    while True:
-        try:
-            await asyncio.sleep(60)
-            async with db_pool.acquire() as conn:
-                expired = await conn.fetch(
-                    "SELECT * FROM vote_sessions "
-                    "WHERE status='active' AND closes_at IS NOT NULL AND closes_at <= NOW()"
-                )
-            for session in expired:
-                logging.info(f"Авто-закрытие голосования #{session['id']} ({session['vote_type']})")
-                try:
-                    await _do_close_vote(dict(session))
-                    if ADMIN_ID:
-                        label = _vote_short_label(session['vote_type'], session['period'])
-                        await bot.send_message(
-                            ADMIN_ID,
-                            f"⏰ Голосование «{label}» автоматически закрыто.",
-                        )
-                except Exception as e:
-                    logging.error(f"Ошибка авто-закрытия голосования #{session['id']}: {e}")
-        except Exception as e:
-            logging.error(f"Ошибка в vote_auto_close_loop: {e}")
 
 @dp.message(Command("debugenv"))
 async def debug_env(m: types.Message):
@@ -1957,295 +1137,13 @@ async def debug_env(m: types.Message):
         parse_mode="HTML"
     )
 
-@dp.message(Command("checkchannel"))
-async def check_channel_cmd(m: types.Message):
-    """Проверка доступности канала и прав бота."""
-    if m.from_user.id != ADMIN_ID:
-        return
-    channel_id = get_channel_id()
-    if not channel_id:
-        await m.answer("❌ CHANNEL_ID не задан или имеет некорректный формат.")
-        return
-    try:
-        chat = await bot.get_chat(channel_id)
-        me = await bot.get_me()
-        member = await bot.get_chat_member(channel_id, me.id)
-        status = getattr(member, "status", "unknown")
-        can_restrict = getattr(member, "can_restrict_members", None)
-        if status == "creator":
-            rights = "создатель канала"
-        elif status == "administrator" and can_restrict:
-            rights = "администратор, блокировка участников разрешена"
-        elif status == "administrator":
-            rights = "администратор, но права блокировки нет"
-        else:
-            rights = f"статус {status}, прав администратора недостаточно"
-        await m.answer(
-            f"✅ Канал найден: <b>{html.escape(chat.title or 'без названия')}</b>\n"
-            f"🤖 Права бота: <b>{html.escape(rights)}</b>",
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        logging.error("Проверка канала не пройдена: %s", e)
-        await m.answer(
-            "❌ Бот не видит канал по текущему CHANNEL_ID.\n"
-            "Добавь этого бота в нужный канал администратором и проверь CHANNEL_ID."
-        )
-
-_WS_RE = re.compile(r'\s+')
-_ALNUM_RE = re.compile(r'[^a-z0-9а-яё]+')
-
-def _normalize_str(s: str) -> str:
-    """Нормализует строку для сравнения: убирает невидимые символы,
-    NFKC-нормализация, нижний регистр, обрезка и схлопывание пробелов."""
-    if not s:
-        return ""
-    for ch in ('\u200b', '\u200c', '\u200d', '\ufeff', '\u00a0'):
-        s = s.replace(ch, ' ' if ch == '\u00a0' else '')
-    s = unicodedata.normalize('NFKC', s)
-    s = s.lower().strip()
-    s = _WS_RE.sub(' ', s)
-    return s
-
-def _alnum_only(s: str) -> str:
-    """Только буквы и цифры в нижнем регистре (всё остальное удаляется)."""
-    return _ALNUM_RE.sub('', _normalize_str(s))
-
-def _artist_keys(name: str) -> set:
-    """Множество ключей для сравнения имени артиста: нормализованные
-    варианты + версии без пробелов + только буквы/цифры + translit."""
-    keys = set()
-    n = _normalize_str(name)
-    if not n:
-        return keys
-    keys.add(n)
-    keys.add(n.replace(' ', ''))
-    keys.add(_alnum_only(n))
-    for v in get_var(n):
-        nv = _normalize_str(v)
-        if nv:
-            keys.add(nv)
-            keys.add(nv.replace(' ', ''))
-            keys.add(_alnum_only(nv))
-    keys.discard('')
-    return keys
-
-async def _find_artist_candidates(conn, query: str, limit: int = 8):
-    """Ищет артистов в Python — это надёжнее, чем чистый SQL ILIKE,
-    потому что мы можем нормализовать невидимые символы, схлопнуть
-    повторные пробелы, применить NFKC и translit-варианты с обеих сторон.
-    Возвращает [{"artist", "track_count", "exact"}] по убыванию релевантности.
-    """
-    q_keys = _artist_keys(query)
-    if not q_keys:
-        return []
-
-    q_norm = _normalize_str(query)
-    q_subs = set(k for k in q_keys if k)
-    q_tokens = [t for t in q_norm.split(' ') if t]
-
-    rows = await conn.fetch(
-        "SELECT artist, COUNT(*) AS track_count FROM tracks "
-        "WHERE artist IS NOT NULL AND artist <> '' "
-        "GROUP BY artist"
-    )
-
-    exact_hits, sub_hits, token_hits = [], [], []
-    for r in rows:
-        artist = r['artist']
-        a_keys = _artist_keys(artist)
-        if not a_keys:
-            continue
-        if a_keys & q_keys:
-            exact_hits.append((artist, r['track_count']))
-            continue
-        matched = False
-        for ak in a_keys:
-            for qs in q_subs:
-                if qs and qs in ak:
-                    sub_hits.append((artist, r['track_count']))
-                    matched = True
-                    break
-            if matched:
-                break
-        if matched:
-            continue
-        if len(q_tokens) >= 2:
-            if all(any(tok in ak for ak in a_keys) for tok in q_tokens):
-                token_hits.append((artist, r['track_count']))
-
-    def _sort(hits):
-        hits.sort(key=lambda x: (-x[1], x[0].lower()))
-        return hits
-
-    if exact_hits:
-        return [{"artist": a, "track_count": c, "exact": True, "match_field": "artist"}
-                for a, c in _sort(exact_hits)[:limit]]
-    if sub_hits:
-        return [{"artist": a, "track_count": c, "exact": False, "match_field": "artist"}
-                for a, c in _sort(sub_hits)[:limit]]
-    if token_hits:
-        return [{"artist": a, "track_count": c, "exact": False, "match_field": "artist"}
-                for a, c in _sort(token_hits)[:limit]]
-
-    # Fallback: ничего не нашли в колонке artist — ищем в title (как обычный поиск).
-    # Возвращаем синтетический кандидат с меткой запроса.
-    var = get_var(query)
-    if var:
-        where_parts = []
-        params = []
-        for v in var:
-            v_esc = _esc_like(v)
-            params.append('%' + v_esc + '%')
-            where_parts.append(f"title ILIKE ${len(params)}")
-        if where_parts:
-            where = ' OR '.join(where_parts)
-            cnt = await conn.fetchval(
-                f"SELECT COUNT(*) FROM tracks WHERE {where}", *params
-            )
-            if cnt and cnt > 0:
-                return [{
-                    "artist": query.strip(),
-                    "track_count": int(cnt),
-                    "exact": True,
-                    "match_field": "title",
-                }]
-    return []
-
-async def _fetch_vote_tracks(conn, cand, limit: int):
-    """Достаёт треки для голосования по найденному кандидату-артисту.
-    Если совпадение было по колонке title — ищет по title (через ILIKE
-    со всеми вариантами транслита), иначе строго по artist=$1."""
-    if cand.get('match_field') == 'title':
-        var = get_var(cand['artist'])
-        where_parts = []
-        params = []
-        for v in var:
-            v_esc = _esc_like(v)
-            params.append('%' + v_esc + '%')
-            where_parts.append(f"title ILIKE ${len(params)}")
-        if not where_parts:
-            return []
-        where = ' OR '.join(where_parts)
-        params.append(limit)
-        return await conn.fetch(
-            f"SELECT id, title, artist FROM tracks WHERE {where} "
-            f"ORDER BY plays DESC, id LIMIT ${len(params)}",
-            *params
-        )
-    return await conn.fetch(
-        "SELECT id, title, artist FROM tracks WHERE artist=$1 "
-        "ORDER BY plays DESC, id LIMIT $2",
-        cand['artist'], limit
-    )
-
-async def _resolve_artist(conn, query: str):
-    """Возвращает каноничное имя артиста или None (лучший кандидат)."""
-    cands = await _find_artist_candidates(conn, query, limit=1)
-    return cands[0]["artist"] if cands else None
-
-@dp.message(Command("findartist"))
-async def find_artist_cmd(m: types.Message):
-    """Диагностика поиска артиста. Показывает, кого находит бот по запросу."""
-    if m.from_user.id != ADMIN_ID:
-        return
-    args = m.text.split(maxsplit=1)
-    query = args[1].strip() if len(args) > 1 else ""
-    if not query:
-        await m.answer(
-            "Использование: <code>/findartist &lt;запрос&gt;</code>",
-            parse_mode="HTML"
-        )
-        return
-    async with db_pool.acquire() as conn:
-        total_artists = await conn.fetchval(
-            "SELECT COUNT(DISTINCT artist) FROM tracks "
-            "WHERE artist IS NOT NULL AND artist <> ''"
-        )
-        cands = await _find_artist_candidates(conn, query, limit=10)
-    keys = sorted(_artist_keys(query))
-    lines = [
-        f"🔍 <b>Запрос:</b> <code>{html.escape(query)}</code>",
-        f"📚 <b>Артистов в базе:</b> {total_artists}",
-        f"🔑 <b>Ключи поиска ({len(keys)}):</b> <code>{html.escape(', '.join(keys))}</code>",
-        "",
-    ]
-    if not cands:
-        lines.append("❌ Совпадений не найдено")
-        async with db_pool.acquire() as conn:
-            sample = await conn.fetch(
-                "SELECT artist, COUNT(*) AS c FROM tracks "
-                "WHERE artist IS NOT NULL AND artist <> '' "
-                "GROUP BY artist ORDER BY c DESC, artist ASC LIMIT 20"
-            )
-        if sample:
-            lines.append("")
-            lines.append(f"📂 <b>Что есть в базе (до 20):</b>")
-            for r in sample:
-                lines.append(
-                    f"• <b>{html.escape(r['artist'])}</b> — {r['c']} тр."
-                )
-    else:
-        lines.append(f"✅ <b>Найдено ({len(cands)}):</b>")
-        for i, c in enumerate(cands, 1):
-            mark = "★" if c['exact'] else "·"
-            lines.append(
-                f"{i}. {mark} <b>{html.escape(c['artist'])}</b> — {c['track_count']} тр."
-            )
-    await m.answer("\n".join(lines), parse_mode="HTML")
-
-def _format_artist_candidates(cands, query: str) -> str:
-    """Форматирует список кандидатов для показа админу."""
-    lines = [f"❓ По запросу «{html.escape(query)}» нашлось несколько артистов:\n"]
-    for i, c in enumerate(cands, 1):
-        lines.append(f"{i}. <b>{html.escape(c['artist'])}</b> — {c['track_count']} тр.")
-    lines.append("\nУточни имя в команде.")
-    return "\n".join(lines)
-
-def _parse_hours(arg: str):
-    """Парсит аргумент часов. Возвращает (hours, error_msg)."""
-    stripped = arg.strip()
-    if not stripped:
-        return None, None
-    if stripped.isdigit():
-        h = int(stripped)
-        if h < 1:
-            return None, "❌ Минимум 1 час."
-        if h > 720:
-            return None, "❌ Максимум 720 часов (30 дней)."
-        return h, None
-    return None, f"❌ Неверный формат времени: <code>{html.escape(stripped)}</code>\nУкажи целое число часов, например: /startday 24"
-
-def _parse_artist_and_hours(text: str):
-    """Разбирает '<команда> [артист...] [часов]'. Возвращает (artist_or_None, hours_or_None, err_or_None)."""
-    parts = text.split()[1:]
-    hours = None
-    if parts and parts[-1].isdigit():
-        h, err = _parse_hours(parts[-1])
-        if err:
-            return None, None, err
-        hours = h
-        parts = parts[:-1]
-    artist = " ".join(parts).strip() or None
-    return artist, hours, None
-
 @dp.message(Command("startday"))
 async def start_day(m: types.Message):
-    if m.from_user.id != ADMIN_ID: return
-    artist, hours, err = _parse_artist_and_hours(m.text)
-    if err:
-        await m.answer(err, parse_mode="HTML")
-        return
-    await _start_vote(m, 'day', limit=5, hours=hours, artist=artist)
+    await _start_vote(m, 'day', limit=5)
 
 @dp.message(Command("startweek"))
 async def start_week(m: types.Message):
-    if m.from_user.id != ADMIN_ID: return
-    artist, hours, err = _parse_artist_and_hours(m.text)
-    if err:
-        await m.answer(err, parse_mode="HTML")
-        return
-    await _start_vote(m, 'week', limit=10, hours=hours, artist=artist)
+    await _start_vote(m, 'week', limit=10)
 
 @dp.message(Command("closeday"))
 async def close_day(m: types.Message):
@@ -2254,113 +1152,6 @@ async def close_day(m: types.Message):
 @dp.message(Command("closeweek"))
 async def close_week(m: types.Message):
     await _close_vote(m, 'week')
-
-@dp.message(Command("startartist"))
-async def start_artist(m: types.Message):
-    if m.from_user.id != ADMIN_ID: return
-    args = m.text.split(maxsplit=2)
-    if len(args) < 2:
-        await m.answer(
-            "Использование: <code>/startartist &lt;исполнитель&gt; [часов]</code>\n"
-            "Например: <code>/startartist Eminem 24</code>",
-            parse_mode="HTML"
-        )
-        return
-    artist_query = args[1].strip()
-    hours, err = _parse_hours(args[2] if len(args) > 2 else "")
-    if err:
-        await m.answer(err, parse_mode="HTML")
-        return
-    channel_id = get_channel_id()
-    if not channel_id:
-        await m.answer("❌ CHANNEL_ID не задан в переменных окружения")
-        return
-    async with db_pool.acquire() as conn:
-        cands = await _find_artist_candidates(conn, artist_query, limit=8)
-        if not cands:
-            await m.answer(f"❌ Исполнитель «{html.escape(artist_query)}» не найден в базе")
-            return
-        if len(cands) > 1 and not cands[0]['exact']:
-            await m.answer(_format_artist_candidates(cands, artist_query), parse_mode="HTML")
-            return
-        canonical = cands[0]['artist']
-        existing = await conn.fetchval(
-            "SELECT id FROM vote_sessions WHERE vote_type='artist' AND period=$1 AND status='active'",
-            canonical
-        )
-        if existing:
-            await m.answer(f"⚠️ Голосование за {html.escape(canonical)} уже идёт")
-            return
-        tracks = await _fetch_vote_tracks(conn, cands[0], 10)
-        if len(tracks) < 2:
-            await m.answer(f"❌ У {html.escape(canonical)} меньше 2 треков в базе")
-            return
-        await conn.execute(
-            "DELETE FROM vote_sessions WHERE vote_type='artist' AND period=$1 AND status<>'active'",
-            canonical
-        )
-        closes_at = datetime.datetime.utcnow() + datetime.timedelta(hours=hours) if hours else None
-        session_id = await conn.fetchval(
-            "INSERT INTO vote_sessions (vote_type, period, closes_at) "
-            "VALUES ('artist', $1, $2) RETURNING id",
-            canonical, closes_at
-        )
-        await conn.executemany(
-            "INSERT INTO vote_candidates (session_id, track_id) VALUES ($1, $2)",
-            [(session_id, t['id']) for t in tracks]
-        )
-    rows = await get_vote_counts(session_id)
-    text = build_vote_text('artist', canonical, rows, closes_at=closes_at)
-    kb = build_vote_keyboard(session_id, rows)
-    try:
-        msg = await bot.send_message(channel_id, text, parse_mode="HTML", reply_markup=kb)
-    except Exception as e:
-        await m.answer(f"❌ Не удалось отправить в канал: {e}")
-        return
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE vote_sessions SET channel_message_id=$1, channel_chat_id=$2 WHERE id=$3",
-            msg.message_id, channel_id, session_id
-        )
-    timer_info = f" Закроется через {hours}ч." if hours else ""
-    await m.answer(
-        f"✅ Голосование «Лучшие треки {html.escape(canonical)}» запущено! "
-        f"{len(tracks)} треков (по числу прослушиваний).{timer_info}",
-        parse_mode="HTML"
-    )
-
-@dp.message(Command("closeartist"))
-async def close_artist(m: types.Message):
-    if m.from_user.id != ADMIN_ID: return
-    args = m.text.split(maxsplit=1)
-    artist_query = args[1].strip() if len(args) > 1 else None
-    async with db_pool.acquire() as conn:
-        if artist_query:
-            session = await conn.fetchrow(
-                "SELECT * FROM vote_sessions WHERE vote_type='artist' AND status='active' "
-                "AND period ILIKE $1 ORDER BY created_at DESC LIMIT 1",
-                artist_query
-            )
-        else:
-            session = await conn.fetchrow(
-                "SELECT * FROM vote_sessions WHERE vote_type='artist' AND status='active' "
-                "ORDER BY created_at DESC LIMIT 1"
-            )
-    if not session:
-        await m.answer("❌ Нет активного голосования по исполнителю")
-        return
-    rows = await _do_close_vote(dict(session))
-    if rows:
-        winner = rows[0]
-        total = sum(r['vote_count'] for r in rows)
-        winner_name = html.escape(format_track(winner['artist'], winner['title']))
-        await m.answer(
-            f"✅ Голосование закрыто.\n🏆 Победитель: <b>{winner_name}</b>\n"
-            f"👥 Всего голосов: {total}",
-            parse_mode="HTML"
-        )
-    else:
-        await m.answer("✅ Голосование закрыто.")
 
 @dp.message(Command("votestatus"))
 async def vote_status(m: types.Message):
@@ -2376,11 +1167,11 @@ async def vote_status(m: types.Message):
     for s in sessions:
         rows = await get_vote_counts(s['id'])
         total = sum(r['vote_count'] for r in rows)
-        label = _vote_short_label(s['vote_type'], s['period'])
+        label = "Трек дня" if s['vote_type'] == 'day' else "Трек недели"
         lines = [f"{i+1}. {html.escape(format_track(r['artist'], r['title']))} — {r['vote_count']} гол."
                  for i, r in enumerate(rows)]
         await m.answer(
-            f"📊 <b>{html.escape(label)}</b>\nВсего голосов: {total}\n\n" + "\n".join(lines),
+            f"📊 <b>{label}</b> ({s['period']})\nВсего голосов: {total}\n\n" + "\n".join(lines),
             parse_mode="HTML"
         )
 
@@ -2417,627 +1208,17 @@ async def handle_vote(c: types.CallbackQuery):
                 session_id, track_id, c.from_user.id
             )
         rows = await get_vote_counts(session_id)
-        text = build_vote_text(session['vote_type'], session['period'], rows, closes_at=session['closes_at'])
+        text = build_vote_text(session['vote_type'], session['period'], rows)
         kb = build_vote_keyboard(session_id, rows)
         try:
             await c.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-        except Exception:
-            pass
+        except: pass
         voted_row = next((r for r in rows if r['track_id'] == track_id), None)
         name = html.escape(format_track(voted_row['artist'], voted_row['title'])) if voted_row else "трек"
         await c.answer(f"✅ Голос за «{name}» засчитан!", show_alert=True)
     except Exception as e:
         logging.error(f"Ошибка в handle_vote: {e}")
         await c.answer("❌ Ошибка", show_alert=True)
-
-# --- ПРОДАЖА STARS ---
-
-async def _get_setting(key: str) -> str:
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT value FROM bot_settings WHERE key=$1", key)
-        return row['value'] if row else ""
-
-async def _set_setting(key: str, value: str):
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO bot_settings (key, value) VALUES ($1, $2) "
-            "ON CONFLICT (key) DO UPDATE SET value=$2",
-            key, value
-        )
-
-@dp.message(F.text == "⭐️ Купить Stars")
-async def buy_stars_start(m: types.Message, state: FSMContext):
-    rate_str = await _get_setting("star_rate")
-    payment_info = await _get_setting("star_payment")
-    if not rate_str or not payment_info:
-        await m.answer(
-            "⭐️ Продажа Stars временно недоступна.\n"
-            "Попробуй позже или напиши администратору."
-        )
-        return
-    rate = float(rate_str)
-    currency = await _get_setting("star_currency") or "руб."
-    presets = [50, 100, 250, 500, 1000, 2500]
-    preset_buttons = [
-        [InlineKeyboardButton(
-            text=f"{n} ⭐️ — {round(n / 50 * rate, 2):g} {currency}",
-            callback_data=f"starbuy_{n}"
-        )]
-        for n in presets
-    ]
-    preset_buttons.append(
-        [InlineKeyboardButton(text="✏️ Ввести другое количество", callback_data="starbuy_custom")]
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=preset_buttons)
-    await state.set_state(BuyStarsForm.waiting_amount)
-    await m.answer(
-        f"⭐️ <b>Купить Telegram Stars</b>\n\n"
-        f"Выбери количество или введи своё (минимум 50):",
-        parse_mode="HTML",
-        reply_markup=kb
-    )
-
-@dp.message(BuyStarsForm.waiting_amount, F.text & ~F.text.startswith("/"))
-async def buy_stars_amount(m: types.Message, state: FSMContext):
-    txt = (m.text or "").strip()
-    if not txt.isdigit():
-        await m.answer("❌ Введи целое число, например: <code>100</code>", parse_mode="HTML")
-        return
-    amount = int(txt)
-    if amount < 50 or amount > 10000:
-        await m.answer("❌ Минимум 50, максимум 10 000 Stars.")
-        return
-    rate_str = await _get_setting("star_rate")
-    payment_info = await _get_setting("star_payment")
-    if not rate_str or not payment_info:
-        await state.clear()
-        await m.answer("❌ Продажа недоступна, попробуй позже.")
-        return
-    rate = float(rate_str)
-    currency = await _get_setting("star_currency") or "руб."
-    total = round(amount / 50 * rate, 2)
-    await state.update_data(amount=amount, total=total)
-    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Оплатил", callback_data=f"starpaid_{amount}_{total}")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="starcancel_user")]
-    ])
-    await m.answer(
-        f"⭐️ <b>Твой заказ:</b> {amount} Stars\n"
-        f"💰 <b>Сумма к оплате:</b> {total:g} {html.escape(currency)}\n\n"
-        f"<b>Реквизиты для оплаты:</b>\n{html.escape(payment_info)}\n\n"
-        f"После оплаты нажми «✅ Оплатил» — мы проверим и отправим Stars.",
-        parse_mode="HTML",
-        reply_markup=confirm_kb
-    )
-    await state.clear()
-
-@dp.callback_query(F.data.startswith("starbuy_"))
-async def starbuy_preset(c: types.CallbackQuery, state: FSMContext):
-    val = c.data[len("starbuy_"):]
-    if val == "custom":
-        await c.answer()
-        await c.message.edit_reply_markup(reply_markup=None)
-        await c.message.answer(
-            "✏️ Введи количество Stars (минимум 10, максимум 10 000):\n\nДля отмены: /cancel"
-        )
-        return
-    try:
-        amount = int(val)
-    except ValueError:
-        await c.answer("❌ Ошибка", show_alert=True)
-        return
-    rate_str = await _get_setting("star_rate")
-    payment_info = await _get_setting("star_payment")
-    currency = await _get_setting("star_currency") or "руб."
-    if not rate_str or not payment_info:
-        await c.answer("❌ Продажа недоступна, попробуй позже.", show_alert=True)
-        return
-    rate = float(rate_str)
-    total = round(amount / 50 * rate, 2)
-    await state.clear()
-    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Оплатил", callback_data=f"starpaid_{amount}_{total}")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="starcancel_user")]
-    ])
-    await c.answer()
-    await c.message.edit_reply_markup(reply_markup=None)
-    await c.message.answer(
-        f"⭐️ <b>Твой заказ:</b> {amount} Stars\n"
-        f"💰 <b>Сумма к оплате:</b> {total:g} {html.escape(currency)}\n\n"
-        f"<b>Реквизиты для оплаты:</b>\n{html.escape(payment_info)}\n\n"
-        f"После оплаты нажми «✅ Оплатил» — мы проверим и отправим Stars.",
-        parse_mode="HTML",
-        reply_markup=confirm_kb
-    )
-
-@dp.callback_query(F.data.startswith("starpaid_"))
-async def buy_stars_paid(c: types.CallbackQuery):
-    parts = c.data.split("_")
-    amount = int(parts[1])
-    total = float(parts[2])
-    async with db_pool.acquire() as conn:
-        order_id = await conn.fetchval(
-            "INSERT INTO star_orders (user_id, username, full_name, amount_stars, price_total) "
-            "VALUES ($1, $2, $3, $4, $5) RETURNING id",
-            c.from_user.id, c.from_user.username, c.from_user.full_name,
-            amount, total
-        )
-    if ADMIN_ID:
-        who = f"@{c.from_user.username}" if c.from_user.username else c.from_user.full_name
-        try:
-            await bot.send_message(
-                ADMIN_ID,
-                f"⭐️ <b>Новый заказ Stars #{order_id}</b>\n"
-                f"👤 {html.escape(who or str(c.from_user.id))} (id: <code>{c.from_user.id}</code>)\n"
-                f"🌟 Количество: <b>{amount} Stars</b>\n"
-                f"💰 Сумма: <b>{total:g} руб.</b>\n\n"
-                f"Чтобы выполнить: <code>/stardone {order_id}</code>\n"
-                f"Чтобы отменить: <code>/stardecline {order_id}</code>",
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            logging.error(f"Ошибка уведомления админа о заказе Stars: {e}")
-    await c.message.edit_reply_markup(reply_markup=None)
-    await c.answer()
-    await c.message.answer(
-        f"✅ <b>Заявка #{order_id} принята!</b>\n\n"
-        f"Мы проверим оплату и отправим <b>{amount} ⭐️</b> в ближайшее время.\n"
-        f"Если возникнут вопросы — напиши администратору.",
-        parse_mode="HTML"
-    )
-
-@dp.callback_query(F.data == "starcancel_user")
-async def buy_stars_cancel_user(c: types.CallbackQuery):
-    await c.message.edit_reply_markup(reply_markup=None)
-    await c.answer("Заявка отменена")
-    await c.message.answer("❌ Заявка отменена.", reply_markup=menu)
-
-@dp.message(Command("setcurrency"))
-async def set_currency_cmd(m: types.Message):
-    if m.from_user.id != ADMIN_ID: return
-    args = m.text.split(maxsplit=1)
-    if len(args) < 2:
-        cur = await _get_setting("star_currency") or "руб."
-        await m.answer(
-            f"Текущая валюта: <b>{html.escape(cur)}</b>\n\n"
-            f"Использование: <code>/setcurrency USDT</code> или <code>/setcurrency AMD</code> или <code>/setcurrency $</code>",
-            parse_mode="HTML"
-        )
-        return
-    currency = args[1].strip()[:20]
-    await _set_setting("star_currency", currency)
-    await m.answer(f"✅ Валюта установлена: <b>{html.escape(currency)}</b>", parse_mode="HTML")
-
-@dp.message(Command("setstarrate"))
-async def set_star_rate(m: types.Message):
-    if m.from_user.id != ADMIN_ID: return
-    args = m.text.split(maxsplit=1)
-    currency = await _get_setting("star_currency") or "руб."
-    if len(args) < 2:
-        cur = await _get_setting("star_rate")
-        cur_txt = f"Текущая цена: 50 Stars = {cur} {currency}" if cur else "Цена не установлена"
-        await m.answer(
-            f"{cur_txt}\n\nИспользование: <code>/setstarrate 2.5</code>\n"
-            f"(цена за минимальный пакет — 50 Stars)",
-            parse_mode="HTML"
-        )
-        return
-    try:
-        rate = float(args[1].replace(",", "."))
-        assert rate > 0
-    except Exception:
-        await m.answer("❌ Введи корректное число, например: <code>/setstarrate 2.5</code>", parse_mode="HTML")
-        return
-    await _set_setting("star_rate", str(rate))
-    await m.answer(
-        f"✅ Цена установлена: 50 Stars = <b>{rate:g} {html.escape(currency)}</b>",
-        parse_mode="HTML"
-    )
-
-@dp.message(Command("setpayment"))
-async def set_payment_info(m: types.Message):
-    if m.from_user.id != ADMIN_ID: return
-    args = m.text.split(maxsplit=1)
-    if len(args) < 2:
-        cur = await _get_setting("star_payment")
-        cur_txt = f"Текущие реквизиты:\n{cur}" if cur else "Реквизиты не установлены"
-        await m.answer(
-            f"{cur_txt}\n\nИспользование:\n<code>/setpayment Карта 4276... Иванов И.И.</code>",
-            parse_mode="HTML"
-        )
-        return
-    await _set_setting("star_payment", args[1].strip())
-    await m.answer("✅ Реквизиты сохранены.", parse_mode="HTML")
-
-@dp.message(Command("starorders"))
-async def star_orders_cmd(m: types.Message):
-    if m.from_user.id != ADMIN_ID: return
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT id, user_id, username, full_name, amount_stars, price_total, status, created_at "
-            "FROM star_orders ORDER BY created_at DESC LIMIT 20"
-        )
-    if not rows:
-        await m.answer("📭 Заказов Stars пока нет.")
-        return
-    lines = ["⭐️ <b>Последние 20 заказов Stars:</b>\n"]
-    status_icons = {"pending": "⏳", "done": "✅", "declined": "❌"}
-    for r in rows:
-        who = f"@{r['username']}" if r['username'] else (r['full_name'] or f"id{r['user_id']}")
-        icon = status_icons.get(r['status'], "❓")
-        lines.append(
-            f"{icon} <b>#{r['id']}</b> {html.escape(who)} — "
-            f"<b>{r['amount_stars']} ⭐️</b> ({r['price_total']:g} руб.)"
-        )
-    await m.answer("\n".join(lines), parse_mode="HTML")
-
-@dp.message(Command("stardone"))
-async def star_done_cmd(m: types.Message):
-    if m.from_user.id != ADMIN_ID: return
-    args = m.text.split(maxsplit=1)
-    if len(args) < 2 or not args[1].strip().isdigit():
-        await m.answer("Использование: <code>/stardone <id></code>", parse_mode="HTML")
-        return
-    oid = int(args[1].strip())
-    async with db_pool.acquire() as conn:
-        order = await conn.fetchrow(
-            "SELECT * FROM star_orders WHERE id=$1", oid
-        )
-        if not order:
-            await m.answer(f"❌ Заказ #{oid} не найден.")
-            return
-        if order['status'] != 'pending':
-            await m.answer(f"⚠️ Заказ #{oid} уже {order['status']}.")
-            return
-        await conn.execute(
-            "UPDATE star_orders SET status='done', updated_at=NOW() WHERE id=$1", oid
-        )
-    try:
-        await bot.send_message(
-            order['user_id'],
-            f"✅ <b>Заказ #{oid} выполнен!</b>\n\n"
-            f"Тебе отправлено <b>{order['amount_stars']} ⭐️</b>. Спасибо за покупку!",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        await m.answer(f"⚠️ Не удалось уведомить пользователя: {e}")
-    await m.answer(f"✅ Заказ #{oid} помечен выполненным, пользователь уведомлён.")
-
-@dp.message(Command("stardecline"))
-async def star_decline_cmd(m: types.Message):
-    if m.from_user.id != ADMIN_ID: return
-    args = m.text.split(maxsplit=1)
-    if len(args) < 2 or not args[1].strip().isdigit():
-        await m.answer("Использование: <code>/stardecline <id></code>", parse_mode="HTML")
-        return
-    oid = int(args[1].strip())
-    async with db_pool.acquire() as conn:
-        order = await conn.fetchrow(
-            "SELECT * FROM star_orders WHERE id=$1", oid
-        )
-        if not order:
-            await m.answer(f"❌ Заказ #{oid} не найден.")
-            return
-        if order['status'] != 'pending':
-            await m.answer(f"⚠️ Заказ #{oid} уже {order['status']}.")
-            return
-        await conn.execute(
-            "UPDATE star_orders SET status='declined', updated_at=NOW() WHERE id=$1", oid
-        )
-    try:
-        await bot.send_message(
-            order['user_id'],
-            f"❌ <b>Заказ #{oid} отменён.</b>\n\n"
-            f"К сожалению, мы не смогли подтвердить оплату. "
-            f"Если это ошибка — свяжись с администратором.",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        await m.answer(f"⚠️ Не удалось уведомить пользователя: {e}")
-    await m.answer(f"✅ Заказ #{oid} отклонён, пользователь уведомлён.")
-
-def _manual_user_id(m: types.Message) -> int | None:
-    """Берёт ID из аргумента команды или из сообщения, на которое ответили."""
-    args = m.text.split(maxsplit=1) if m.text else []
-    if len(args) > 1 and args[1].strip().isdigit():
-        return int(args[1].strip())
-    replied = m.reply_to_message
-    if replied and replied.from_user:
-        return replied.from_user.id
-    return None
-
-@dp.message(Command("block"))
-async def block_user_cmd(m: types.Message):
-    if m.from_user.id != ADMIN_ID:
-        return
-    channel_id = get_channel_id()
-    if not channel_id:
-        await m.answer("❌ CHANNEL_ID не задан в переменных окружения.")
-        return
-    user_id = _manual_user_id(m)
-    if not user_id:
-        await m.answer(
-            "Использование: <code>/block &lt;user_id&gt;</code>\n"
-            "Или ответь командой /block на сообщение пользователя.",
-            parse_mode="HTML",
-        )
-        return
-    try:
-        await bot.ban_chat_member(chat_id=channel_id, user_id=user_id)
-        SUB_CACHE.pop(user_id, None)
-        await m.answer(
-            f"✅ Пользователь <code>{user_id}</code> заблокирован в канале.",
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        logging.error("Не удалось вручную заблокировать user=%s: %s", user_id, e)
-        await m.answer(
-            "❌ Не удалось заблокировать пользователя. Проверь, что бот "
-            "администратор канала с правом блокировки участников."
-        )
-
-@dp.message(Command("unblock"))
-async def unblock_user_cmd(m: types.Message):
-    if m.from_user.id != ADMIN_ID:
-        return
-    channel_id = get_channel_id()
-    if not channel_id:
-        await m.answer("❌ CHANNEL_ID не задан в переменных окружения.")
-        return
-    user_id = _manual_user_id(m)
-    if not user_id:
-        await m.answer(
-            "Использование: <code>/unblock &lt;user_id&gt;</code>\n"
-            "Или ответь командой /unblock на сообщение пользователя.",
-            parse_mode="HTML",
-        )
-        return
-    try:
-        await bot.unban_chat_member(
-            chat_id=channel_id,
-            user_id=user_id,
-            only_if_banned=True,
-        )
-        SUB_CACHE.pop(user_id, None)
-        await m.answer(
-            f"✅ Блокировка пользователя <code>{user_id}</code> снята.",
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        logging.error("Не удалось снять блокировку user=%s: %s", user_id, e)
-        await m.answer(
-            "❌ Не удалось снять блокировку. Проверь ID пользователя и права бота."
-        )
-
-# --- ЗАЯВКИ НА ТРЕКИ (ПОСТ + КОММЕНТАРИИ В ОБСУЖДАЛКЕ) ---
-
-REQUEST_DEFAULT_TEXT = (
-    "🎵 <b>Какую песню хотите следующей?</b>\n\n"
-    "Нажмите кнопку ниже и напишите боту в личку: исполнитель — название."
-)
-MAX_REQUESTS_PER_USER = 3
-MAX_REQUESTS_PER_SESSION = 500
-
-async def _request_limit_status(conn, session_id: int, user_id: int):
-    """Проверка лимитов заявок. Возвращает (None, None) если можно,
-    иначе (код_ошибки, текст_для_пользователя)."""
-    total = await conn.fetchval(
-        "SELECT COUNT(*) FROM track_requests WHERE session_id=$1", session_id
-    )
-    if total and total >= MAX_REQUESTS_PER_SESSION:
-        return ("session_full",
-                "❌ Лимит заявок в этой сессии исчерпан. Жди следующего поста.")
-    if user_id:
-        from_user = await conn.fetchval(
-            "SELECT COUNT(*) FROM track_requests "
-            "WHERE session_id=$1 AND user_id=$2",
-            session_id, user_id
-        )
-        if from_user and from_user >= MAX_REQUESTS_PER_USER:
-            return ("user_limit",
-                    f"❌ Ты уже отправил {MAX_REQUESTS_PER_USER} "
-                    f"{'заявку' if MAX_REQUESTS_PER_USER == 1 else 'заявки'} "
-                    f"в этой сессии — это максимум.")
-    return (None, None)
-
-@dp.message(Command("askreq"))
-async def ask_requests_cmd(m: types.Message):
-    """Опубликовать в канале пост-приглашение для заявок.
-    Использование: /askreq [текст поста]. Без аргумента — текст по умолчанию."""
-    if m.from_user.id != ADMIN_ID:
-        return
-    channel_id = get_channel_id()
-    if not channel_id:
-        await m.answer("❌ CHANNEL_ID не задан в переменных окружения")
-        return
-    args = m.text.split(maxsplit=1)
-    custom_text = args[1].strip() if len(args) > 1 else ""
-    post_text = custom_text if custom_text else REQUEST_DEFAULT_TEXT
-    if not BOT_USERNAME:
-        await m.answer("❌ Имя бота ещё не определено, попробуй через пару секунд")
-        return
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE request_sessions SET status='closed' WHERE status='active'"
-        )
-        session_id = await conn.fetchval(
-            "INSERT INTO request_sessions "
-            "(channel_chat_id, channel_message_id, title) "
-            "VALUES (NULL, NULL, $1) RETURNING id",
-            (custom_text[:100] if custom_text else "Заявки на трек")
-        )
-    deep_link = f"https://t.me/{BOT_USERNAME}?start=req_{session_id}"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📝 Подать заявку", url=deep_link)]
-    ])
-    try:
-        sent = await bot.send_message(
-            channel_id, post_text, parse_mode="HTML", reply_markup=kb
-        )
-    except Exception as e:
-        async with db_pool.acquire() as conn:
-            await conn.execute(
-                "DELETE FROM request_sessions WHERE id=$1", session_id
-            )
-        await m.answer(f"❌ Не удалось отправить пост в канал: {html.escape(str(e))}")
-        return
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE request_sessions SET channel_chat_id=$1, channel_message_id=$2 "
-            "WHERE id=$3",
-            sent.chat.id, sent.message_id, session_id
-        )
-    await m.answer(
-        f"✅ Пост опубликован (сессия #{session_id}).\n"
-        f"Заявки идут двумя путями:\n"
-        f"• кнопка «Подать заявку» под постом → личка с ботом;\n"
-        f"• комментарии под постом (если у канала есть обсуждалка).\n\n"
-        f"Собрать список — /requests",
-        parse_mode="HTML"
-    )
-
-@dp.message(F.is_automatic_forward, F.forward_from_chat)
-async def request_thread_anchor(m: types.Message):
-    """Авто-форвард поста из канала в обсуждалку. Привязываем
-    активную сессию к этому треду, чтобы потом ловить комментарии."""
-    if m.forward_from_chat.type != "channel":
-        return
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE request_sessions SET discussion_chat_id=$1, "
-            "discussion_thread_id=$2 "
-            "WHERE channel_chat_id=$3 AND channel_message_id=$4 "
-            "AND status='active'",
-            m.chat.id, m.message_id,
-            m.forward_from_chat.id, m.forward_from_message_id
-        )
-
-@dp.message(F.chat.type.in_({"group", "supergroup"}), F.message_thread_id)
-async def request_comment_handler(m: types.Message):
-    """Комментарии под постом-приглашением (в связанной обсуждалке)."""
-    if m.from_user and m.from_user.is_bot:
-        return
-    text = (m.text or m.caption or "").strip()
-    if not text:
-        return
-    async with db_pool.acquire() as conn:
-        session = await conn.fetchrow(
-            "SELECT id FROM request_sessions "
-            "WHERE discussion_chat_id=$1 AND discussion_thread_id=$2 "
-            "AND status='active'",
-            m.chat.id, m.message_thread_id
-        )
-        if not session:
-            return
-        uid = m.from_user.id if m.from_user else None
-        err_code, _ = await _request_limit_status(conn, session['id'], uid)
-        if err_code:
-            return
-        await conn.execute(
-            "INSERT INTO track_requests "
-            "(session_id, user_id, username, full_name, text, discussion_message_id) "
-            "VALUES ($1, $2, $3, $4, $5, $6)",
-            session['id'],
-            uid,
-            m.from_user.username if m.from_user else None,
-            m.from_user.full_name if m.from_user else None,
-            text[:500],
-            m.message_id
-        )
-
-def _format_user_label(username: str, full_name: str, user_id: int) -> str:
-    if username:
-        return f"@{username}"
-    if full_name:
-        return full_name
-    return f"id{user_id}" if user_id else "anon"
-
-@dp.message(Command("requests"))
-async def list_requests_cmd(m: types.Message):
-    """Показать список заявок последней активной сессии."""
-    if m.from_user.id != ADMIN_ID:
-        return
-    async with db_pool.acquire() as conn:
-        session = await conn.fetchrow(
-            "SELECT id, status, discussion_thread_id, created_at "
-            "FROM request_sessions ORDER BY created_at DESC LIMIT 1"
-        )
-        if not session:
-            await m.answer(
-                "❌ Сессий заявок нет. Запусти: <code>/askreq</code>",
-                parse_mode="HTML"
-            )
-            return
-        rows = await conn.fetch(
-            "SELECT id, user_id, username, full_name, text, created_at "
-            "FROM track_requests WHERE session_id=$1 "
-            "ORDER BY created_at ASC",
-            session['id']
-        )
-    status_label = "активна" if session['status'] == 'active' else "закрыта"
-    thread_warn = ""
-    if session['status'] == 'active' and not session['discussion_thread_id']:
-        thread_warn = (
-            "\n⚠️ Бот пока не получил авто-форвард поста в обсуждалку. "
-            "Убедись, что бот добавлен в обсуждалку канала."
-        )
-    if not rows:
-        await m.answer(
-            f"📭 Сессия #{session['id']} ({status_label}) — заявок пока нет.{thread_warn}",
-            parse_mode="HTML"
-        )
-        return
-    lines = [
-        f"📥 <b>Заявки сессии #{session['id']}</b> ({status_label}, всего {len(rows)}):"
-    ]
-    for r in rows:
-        who = _format_user_label(r['username'], r['full_name'], r['user_id'])
-        lines.append(
-            f"{r['id']}. <b>{html.escape(who)}</b>: {html.escape(r['text'])}"
-        )
-    if thread_warn:
-        lines.append(thread_warn)
-    text = "\n".join(lines)
-    for chunk_start in range(0, len(text), 3500):
-        await m.answer(text[chunk_start:chunk_start + 3500], parse_mode="HTML")
-
-@dp.message(Command("closereq"))
-async def close_requests_cmd(m: types.Message):
-    """Закрыть текущую активную сессию заявок."""
-    if m.from_user.id != ADMIN_ID:
-        return
-    async with db_pool.acquire() as conn:
-        session = await conn.fetchrow(
-            "SELECT id FROM request_sessions WHERE status='active' "
-            "ORDER BY created_at DESC LIMIT 1"
-        )
-        if not session:
-            await m.answer("❌ Активных сессий заявок нет")
-            return
-        await conn.execute(
-            "UPDATE request_sessions SET status='closed' WHERE id=$1",
-            session['id']
-        )
-    await m.answer(f"✅ Сессия #{session['id']} закрыта. Новые комментарии не учитываются.")
-
-@dp.message(Command("clearreq"))
-async def clear_requests_cmd(m: types.Message):
-    """Удалить все заявки последней сессии."""
-    if m.from_user.id != ADMIN_ID:
-        return
-    async with db_pool.acquire() as conn:
-        session = await conn.fetchrow(
-            "SELECT id FROM request_sessions ORDER BY created_at DESC LIMIT 1"
-        )
-        if not session:
-            await m.answer("❌ Сессий заявок нет")
-            return
-        deleted = await conn.fetchval(
-            "WITH d AS (DELETE FROM track_requests WHERE session_id=$1 RETURNING 1) "
-            "SELECT COUNT(*) FROM d",
-            session['id']
-        )
-    await m.answer(f"🧹 Удалено заявок: {deleted} (сессия #{session['id']})")
 
 # --- HEALTH CHECK ---
 WEBHOOK_PATH = "/webhook"
@@ -3048,42 +1229,15 @@ async def health_check(request):
 async def main():
     from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-    dp.message.middleware(ThrottleMiddleware())
-    dp.callback_query.middleware(ThrottleMiddleware())
-    dp.message.middleware(RegisterUserMiddleware())
-    dp.callback_query.middleware(RegisterUserMiddleware())
-    dp.message.middleware(SubscriptionMiddleware())
-    dp.callback_query.middleware(SubscriptionMiddleware())
-
     webhook_url = os.environ.get("WEBHOOK_URL", "")
     if not webhook_url:
-        replit_domain = os.environ.get("REPLIT_DEV_DOMAIN", "")
-        if replit_domain:
-            webhook_url = f"https://{replit_domain}"
-            logging.info(f"WEBHOOK_URL не задан, используется REPLIT_DEV_DOMAIN: {webhook_url}")
-        else:
-            raise ValueError("CRITICAL: WEBHOOK_URL не задан!")
+        raise ValueError("CRITICAL: WEBHOOK_URL не задан!")
 
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 8080))
 
     app = web.Application()
     app.router.add_get("/", health_check)
     app.router.add_get("/health", health_check)
-
-    register_webapp(
-        app=app,
-        dp=dp,
-        bot=bot,
-        db_pool_getter=lambda: db_pool,
-        bot_token=BOT_TOKEN,
-        is_subscribed=is_subscribed,
-        run_search=run_search,
-        format_track=format_track,
-        track_keyboard=track_keyboard,
-        num_buttons=num_buttons,
-        static_dir=os.path.join(os.path.dirname(__file__), "webapp"),
-        max_playlists=MAX_PLAYLISTS,
-    )
 
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
@@ -3097,47 +1251,17 @@ async def main():
     await init_db_pool()
     await init_db()
 
-    global BOT_USERNAME
-    try:
-        me = await bot.get_me()
-        BOT_USERNAME = me.username or ""
-        logging.info(f"✅ Bot username: @{BOT_USERNAME}")
-    except Exception as e:
-        logging.error(f"❌ Не удалось получить username бота: {e}")
-
+    await bot.delete_webhook(drop_pending_updates=True)
     full_url = webhook_url.rstrip("/") + WEBHOOK_PATH
-    try:
-        info = await bot.get_webhook_info()
-        current_url = (info.url or "").rstrip("/")
-    except Exception as e:
-        logging.warning(f"Не удалось получить webhook info: {e}")
-        current_url = ""
-    allowed_updates = [
-        "message",
-        "callback_query",
-        "channel_post",
-        "pre_checkout_query",
-        "chat_member",
-    ]
-    await bot.set_webhook(
-        url=full_url,
-        drop_pending_updates=False,
-        allowed_updates=allowed_updates,
-    )
-    if current_url != full_url:
-        logging.info(f"✅ Webhook обновлён: {full_url}")
-    else:
-        logging.info("✅ Webhook проверен — chat_member апдейты включены")
-
-    asyncio.create_task(vote_auto_close_loop())
-    logging.info("✅ Авто-закрытие голосований запущено")
+    await bot.set_webhook(url=full_url)
+    logging.info(f"✅ Webhook установлен: {full_url}")
 
     try:
         while True:
             await asyncio.sleep(3600)
     except (KeyboardInterrupt, SystemExit):
-        logging.info("Остановка бота... webhook оставляем зарегистрированным, "
-                     "чтобы Telegram копил апдейты до следующего запуска")
+        logging.info("Остановка бота...")
+        await bot.delete_webhook()
         await runner.cleanup()
         if db_pool:
             await db_pool.close()
