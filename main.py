@@ -19,6 +19,8 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeybo
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 
+from webapp_api import register_webapp
+
 # --- НАСТРОЙКИ ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -1227,6 +1229,10 @@ WEBHOOK_PATH = "/webhook"
 async def health_check(request):
     return web.Response(text="ok")
 
+async def miniapp_access_allowed(user_id: int) -> bool:
+    """Доступ к Mini App разрешён авторизованным Telegram-пользователям."""
+    return True
+
 async def main():
     from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
@@ -1241,9 +1247,24 @@ async def main():
     app = web.Application()
     app.router.add_get("/", health_check)
     app.router.add_get("/health", health_check)
-    if base_path and base_path != "/":
+    if base_path and base_path not in ("/", "/app"):
         app.router.add_get(base_path, health_check)
         app.router.add_get(f"{base_path}/", health_check)
+
+    register_webapp(
+        app=app,
+        dp=dp,
+        bot=bot,
+        db_pool_getter=lambda: db_pool,
+        bot_token=BOT_TOKEN,
+        is_subscribed=miniapp_access_allowed,
+        run_search=run_search,
+        format_track=format_track,
+        track_keyboard=track_keyboard,
+        num_buttons=num_buttons,
+        static_dir=os.path.join(os.path.dirname(__file__), "webapp"),
+        max_playlists=MAX_PLAYLISTS,
+    )
 
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=webhook_path)
     setup_application(app, dp, bot=bot)
