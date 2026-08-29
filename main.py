@@ -6,6 +6,7 @@ import html
 import random
 import datetime
 import asyncpg
+from urllib.parse import urlparse
 
 from aiohttp import web
 
@@ -1234,12 +1235,17 @@ async def main():
         raise ValueError("CRITICAL: WEBHOOK_URL не задан!")
 
     port = int(os.environ.get("PORT", 8080))
+    base_path = urlparse(webhook_url).path.rstrip("/")
+    webhook_path = f"{base_path}{WEBHOOK_PATH}" if base_path else WEBHOOK_PATH
 
     app = web.Application()
     app.router.add_get("/", health_check)
     app.router.add_get("/health", health_check)
+    if base_path and base_path != "/":
+        app.router.add_get(base_path, health_check)
+        app.router.add_get(f"{base_path}/", health_check)
 
-    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
+    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=webhook_path)
     setup_application(app, dp, bot=bot)
 
     runner = web.AppRunner(app)
