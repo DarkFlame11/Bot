@@ -485,6 +485,22 @@ async def init_db():
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_users_active ON users (is_active) WHERE is_active = TRUE"
         )
+        # Журнал прослушиваний: нужен для топа за неделю/месяц (tracks.plays хранит только сумму за всё время)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS track_plays (
+                id BIGSERIAL PRIMARY KEY,
+                track_id INTEGER NOT NULL,
+                user_id BIGINT,
+                played_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE
+            )
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_track_plays_time ON track_plays (played_at DESC)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_track_plays_track ON track_plays (track_id, played_at DESC)"
+        )
         logging.info("✅ База данных инициализирована")
 
 # --- СОСТОЯНИЯ ---
@@ -526,6 +542,17 @@ def format_track(a, t):
     return f"{a} — {t}" if clean_artist(a) else t
 
 DIGITS = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
+
+async def log_play(conn, track_id: int, user_id):
+    """Считает прослушивание: общий счётчик + запись в журнал (для топа по периодам).
+    Сбой журнала не должен ломать воспроизведение."""
+    await conn.execute("UPDATE tracks SET plays=plays+1 WHERE id=$1", track_id)
+    try:
+        await conn.execute(
+            "INSERT INTO track_plays (track_id, user_id) VALUES ($1, $2)", track_id, user_id
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось записать прослушивание в журнал: {e}")
 
 def track_line(i, artist, title, extra=""):
     """Двухстрочный блок трека: номер-эмодзи (совпадает с кнопкой), название, исполнитель."""
@@ -836,22 +863,53 @@ async def check_sub_cb(cb: types.CallbackQuery):
         except Exception:
             pass
 
+START_GREETINGS = [
+    "👋 Привет, <b>{name}</b>!",
+    "🎶 Рад тебя видеть, <b>{name}</b>!",
+    "🎧 Здравствуй, <b>{name}</b>! Самое время для музыки.",
+    "🔥 О, <b>{name}</b>! Давай найдём что-нибудь крутое.",
+    "✨ Привет, <b>{name}</b>! Что послушаем сегодня?",
+    "🎵 <b>{name}</b>, добро пожаловать! Музыка уже ждёт.",
+]
+
+BOT_TIPS = [
+    "Пиши запрос и по-русски, и латиницей — найдётся и так, и так.",
+    "Под каждым треком есть «🎵 Похожие треки» — подборка по исполнителю.",
+    "Нажми «➕ В плейлист» под любым треком, чтобы сохранить его в свою подборку.",
+    "В избранном есть кнопка «🎲 Случайный из избранного» — для настроения.",
+    "В топе можно переключать период: неделя, месяц или всё время.",
+    "Хватит и части названия — искать можно по обрывку слова.",
+    "В 🆕 Новом лежат самые свежие добавления — загляни, чтобы не пропустить новинки.",
+]
+
+def random_tip() -> str:
+    return "💡 <i>Совет: " + random.choice(BOT_TIPS) + "</i>"
+
 HELP_TEXT = (
-    "🎧 <b>Музыкальный бот</b>\n\n"
-    "Слушай треки из канала прямо в чате, собирай избранное и плейлисты.\n\n"
-    "🔍 <b>Поиск</b> — название или исполнитель (по-русски или латиницей)\n"
+    "🎧 <b>Музыкальный бот</b>\n"
+    "Слушай треки из канала прямо в чате.\n\n"
+    "━━━━━━━━━━━━━━\n"
+    "🎵 <b>Музыка</b>\n"
+    "🔍 <b>Поиск</b> — название или исполнитель, по-русски или латиницей\n"
     "🎲 <b>Случайный</b> — удиви меня\n"
-    "🔥 <b>Топ</b> — самые популярные треки\n"
-    "🆕 <b>Новое</b> — свежие добавления\n"
-    "❤️ <b>Избранное</b> — твоя коллекция\n"
-    "📋 <b>Плейлисты</b> — до {max_pl} штук, свои названия\n"
-    "💝 <b>Донат</b> — поддержать бота звёздами\n\n"
-    "Просто напиши запрос в чат — я найду трек 👇"
+    "🔥 <b>Топ</b> — что слушают: неделя, месяц, всё время\n"
+    "🆕 <b>Новое</b> — свежие добавления\n\n"
+    "👤 <b>Твоё</b>\n"
+    "❤️ <b>Избранное</b> — любимые треки\n"
+    "📋 <b>Плейлисты</b> — до {max_pl} своих подборок\n"
+    "💝 <b>Донат</b> — поддержать бота звёздами\n"
+    "━━━━━━━━━━━━━━\n\n"
+    "Просто напиши запрос в чат — и я найду трек 👇\n"
+    "⌨️ Команды: /start · /help · /cancel"
 )
 
 @dp.message(Command("help"))
 async def help_cmd(m: types.Message):
-    await m.answer(HELP_TEXT.format(max_pl=MAX_PLAYLISTS), reply_markup=menu, parse_mode="HTML")
+    await m.answer(
+        HELP_TEXT.format(max_pl=MAX_PLAYLISTS) + "\n\n" + random_tip(),
+        reply_markup=menu,
+        parse_mode="HTML"
+    )
 
 @dp.message(Command("start"))
 async def start_cmd(m: types.Message, state: FSMContext):
@@ -884,8 +942,9 @@ async def start_cmd(m: types.Message, state: FSMContext):
             )
             return
     name = html.escape(m.from_user.first_name or "друг")
+    greeting = random.choice(START_GREETINGS).format(name=name)
     await m.answer(
-        f"👋 Привет, <b>{name}</b>!\n\n" + HELP_TEXT.format(max_pl=MAX_PLAYLISTS),
+        f"{greeting}\n\n" + HELP_TEXT.format(max_pl=MAX_PLAYLISTS) + "\n\n" + random_tip(),
         reply_markup=menu,
         parse_mode="HTML"
     )
@@ -994,7 +1053,7 @@ async def _send_random_track(target, user_id: int, query: str = ""):
                 else:
                     await target.answer("❌ Нет треков", show_alert=True)
                 return
-            await conn.execute("UPDATE tracks SET plays=plays+1 WHERE id=$1", r['id'])
+            await log_play(conn, r['id'], user_id)
         kb = await track_keyboard(r['id'], user_id)
         if isinstance(target, types.Message):
             await target.answer_audio(r['file_id'], reply_markup=kb)
@@ -1035,30 +1094,93 @@ async def fav_page_cb(c: types.CallbackQuery):
         logging.error(f"Ошибка в fav_page_cb: {e}")
         await c.answer("❌ Ошибка", show_alert=True)
 
+# Периоды топа: ключ -> (подпись кнопки, подпись в заголовке, SQL-интервал или None).
+# Интервалы задаются только здесь (не приходят от пользователя), поэтому подставляются в SQL безопасно.
+TOP_PERIODS = {
+    "week":  ("📅 Неделя", "за 7 дней", "7 days"),
+    "month": ("🗓 Месяц", "за 30 дней", "30 days"),
+    "all":   ("🏆 Всё время", "за всё время", None),
+}
+
+async def _top_rows(period: str):
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        interval = TOP_PERIODS[period][2]
+        if interval is None:
+            return await conn.fetch(
+                "SELECT id, artist, title, plays AS cnt FROM tracks "
+                "WHERE plays > 0 ORDER BY plays DESC, id LIMIT 10"
+            )
+        return await conn.fetch(
+            f"SELECT t.id, t.artist, t.title, COUNT(*) AS cnt "
+            f"FROM track_plays p JOIN tracks t ON t.id = p.track_id "
+            f"WHERE p.played_at >= CURRENT_TIMESTAMP - INTERVAL '{interval}' "
+            f"GROUP BY t.id, t.artist, t.title "
+            f"ORDER BY cnt DESC, t.id LIMIT 10"
+        )
+
+def _top_period_row(active: str):
+    return [
+        InlineKeyboardButton(
+            text=("✅ " if key == active else "") + label,
+            callback_data=f"top_{key}"
+        )
+        for key, (label, _, _) in TOP_PERIODS.items()
+    ]
+
+async def build_top(period: str, fallback_to_all: bool = False):
+    """Возвращает (текст, клавиатура) топа за период.
+    fallback_to_all: если за период ещё нет прослушиваний, показать топ за всё время."""
+    res = await _top_rows(period)
+    note = ""
+    if not res and fallback_to_all and period != "all":
+        res = await _top_rows("all")
+        if res:
+            period = "all"
+            note = "\n<i>Статистика по неделям только начала копиться — пока показан топ за всё время.</i>"
+    title = f"🔥 <b>Топ треков</b> · {TOP_PERIODS[period][1]}"
+    period_row = _top_period_row(period)
+    if not res:
+        return (
+            f"{title}\n\n📭 За этот период прослушиваний пока нет — послушай пару треков, и они появятся здесь.",
+            InlineKeyboardMarkup(inline_keyboard=[period_row])
+        )
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, t in enumerate(res):
+        block = track_line(i, t['artist'], t['title'], extra=f"{t['cnt']} 🎧")
+        if i < 3:
+            block = block.replace(DIGITS[i], medals[i], 1)
+        lines.append(block)
+    ids = [t['id'] for t in res]
+    text = title + "\n\n" + "\n\n".join(lines) + "\n\n👆 Нажми на номер, чтобы послушать" + note
+    kb = InlineKeyboardMarkup(inline_keyboard=num_buttons(ids) + [period_row])
+    return text, kb
+
 @dp.message(F.text == "🔥 Топ")
 async def top(m: types.Message):
-    pool = await get_db()
     try:
-        async with pool.acquire() as conn:
-            res = await conn.fetch("SELECT id, artist, title, plays FROM tracks ORDER BY plays DESC LIMIT 10")
-        if not res:
-            await m.answer("📭 Топ пока пуст — послушай пару треков, и он появится")
-            return
-        medals = ["🥇", "🥈", "🥉"]
-        lines = []
-        for i, t in enumerate(res):
-            block = track_line(i, t['artist'], t['title'], extra=f"{t['plays']} 🎧")
-            if i < 3:
-                block = block.replace(DIGITS[i], medals[i], 1)
-            lines.append(block)
-        ids = [t['id'] for t in res]
-        await m.answer(
-            "🔥 <b>Топ треков</b>\n\n" + "\n\n".join(lines) + "\n\n👆 Нажми на номер, чтобы послушать",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=num_buttons(ids)),
-            parse_mode="HTML"
-        )
+        text, kb = await build_top("week", fallback_to_all=True)
+        await m.answer(text, reply_markup=kb, parse_mode="HTML")
     except Exception as e:
         logging.error(f"Ошибка в top: {e}")
+
+@dp.callback_query(F.data.startswith("top_"))
+async def top_period_cb(c: types.CallbackQuery):
+    period = c.data[4:]
+    if period not in TOP_PERIODS:
+        await c.answer()
+        return
+    try:
+        text, kb = await build_top(period)
+        try:
+            await c.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            pass  # «message is not modified» при повторном нажатии на ту же вкладку
+        await c.answer()
+    except Exception as e:
+        logging.error(f"Ошибка в top_period_cb: {e}")
+        await c.answer("❌ Ошибка", show_alert=True)
 
 @dp.message(F.text == "🆕 Новое")
 async def new_tracks(m: types.Message):
@@ -1100,7 +1222,7 @@ async def rnd_fav_cb(c: types.CallbackQuery):
         async with db_pool.acquire() as conn:
             r = await conn.fetchrow("SELECT id, file_id FROM tracks WHERE id=$1", chosen)
             if r:
-                await conn.execute("UPDATE tracks SET plays=plays+1 WHERE id=$1", chosen)
+                await log_play(conn, chosen, c.from_user.id)
         kb = await track_keyboard(r['id'], c.from_user.id)
         await c.message.answer_audio(r['file_id'], reply_markup=kb)
         await c.answer()
@@ -1130,7 +1252,7 @@ async def rnd_pl_cb(c: types.CallbackQuery):
         async with db_pool.acquire() as conn:
             r = await conn.fetchrow("SELECT id, file_id FROM tracks WHERE id=$1", chosen)
             if r:
-                await conn.execute("UPDATE tracks SET plays=plays+1 WHERE id=$1", chosen)
+                await log_play(conn, chosen, c.from_user.id)
         kb = await track_keyboard(r['id'], c.from_user.id)
         await c.message.answer_audio(r['file_id'], reply_markup=kb)
         await c.answer()
@@ -1302,7 +1424,7 @@ async def st(c: types.CallbackQuery):
             if not r:
                 await c.answer("❌ Трек не найден", show_alert=True)
                 return
-            await conn.execute("UPDATE tracks SET plays=plays+1 WHERE id=$1", tid)
+            await log_play(conn, tid, c.from_user.id)
         await c.message.answer_audio(r['file_id'], reply_markup=await track_keyboard(tid, c.from_user.id))
         await c.answer()
     except Exception as e:
