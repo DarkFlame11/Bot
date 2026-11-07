@@ -16,7 +16,8 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, LabeledPrice, PreCheckoutQuery
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, LabeledPrice, PreCheckoutQuery, BotCommand
+from aiogram.enums import ChatAction
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 
@@ -516,7 +517,7 @@ menu = ReplyKeyboardMarkup(keyboard=[
     [KeyboardButton(text="🔥 Топ"), KeyboardButton(text="🆕 Новое")],
     [KeyboardButton(text="❤️ Избранное"), KeyboardButton(text="📋 Список Плейлистов")],
     [KeyboardButton(text="💝 Донат")],
-], resize_keyboard=True)
+], resize_keyboard=True, input_field_placeholder="🔍 Название трека или исполнитель…")
 
 def clean_artist(a):
     return "" if a and a.startswith("@") else (a or "")
@@ -525,6 +526,18 @@ def format_track(a, t):
     return f"{a} — {t}" if clean_artist(a) else t
 
 DIGITS = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
+
+def track_line(i, artist, title, extra=""):
+    """Двухстрочный блок трека: номер-эмодзи (совпадает с кнопкой), название, исполнитель."""
+    a = clean_artist(artist)
+    if a == "Unknown":
+        a = ""
+    marker = DIGITS[i] if i < len(DIGITS) else f"{i + 1}."
+    text = f"{marker} <b>{html.escape(title)}</b>"
+    sub = " · ".join(x for x in (html.escape(a) if a else "", extra) if x)
+    if sub:
+        text += f"\n      └ {sub}"
+    return text
 
 def num_buttons(ids):
     b = [InlineKeyboardButton(text=DIGITS[i], callback_data=f"track_{tid}") for i, tid in enumerate(ids)]
@@ -540,9 +553,8 @@ async def track_keyboard(tid, uid):
         callback_data=f"unfav_{tid}" if inf else f"fav_{tid}"
     )
     return InlineKeyboardMarkup(inline_keyboard=[
-        [btn],
-        [InlineKeyboardButton(text="➕ В плейлист", callback_data=f"topl_{tid}")],
-        [InlineKeyboardButton(text="🎵 Похожие", callback_data=f"rec_{tid}")]
+        [btn, InlineKeyboardButton(text="➕ В плейлист", callback_data=f"topl_{tid}")],
+        [InlineKeyboardButton(text="🎵 Похожие треки", callback_data=f"rec_{tid}")]
     ])
 
 # --- ПОИСК И ТРАНСЛИТЕРАЦИЯ ---
@@ -670,14 +682,17 @@ async def show_fav_page(user_id: int, page: int, target, edit: bool = False):
             "SELECT COUNT(*) FROM favorites WHERE user_id=$1", user_id
         )
         if total == 0:
-            text = "❤️ Избранное пусто"
+            text = (
+                "❤️ <b>Избранное пусто</b>\n\n"
+                "Найди трек через 🔍 Поиск или 🎲 Случайный и нажми «❤️ В избранное» — он появится здесь."
+            )
             if edit:
                 try:
-                    await target.message.edit_text(text)
+                    await target.message.edit_text(text, parse_mode="HTML")
                 except Exception:
-                    await target.message.answer(text)
+                    await target.message.answer(text, parse_mode="HTML")
             else:
-                await target.answer(text)
+                await target.answer(text, parse_mode="HTML")
             return
         offset = page * FAV_PAGE_SIZE
         res = await conn.fetch(
@@ -689,18 +704,16 @@ async def show_fav_page(user_id: int, page: int, target, edit: bool = False):
         )
     total_pages = math.ceil(total / FAV_PAGE_SIZE)
     ids = [r['id'] for r in res]
-    lines = [
-        f"{i + 1 + offset}. {html.escape(format_track(r['artist'], r['title']))}"
-        for i, r in enumerate(res)
-    ]
+    lines = [track_line(i, r['artist'], r['title']) for i, r in enumerate(res)]
     h = (
-        f"❤️ <b>Избранное</b> — {total} тр. • Стр. {page + 1}/{total_pages}\n\n"
-        + "\n".join(lines)
+        f"❤️ <b>Избранное</b> · {total} тр. · стр. {page + 1}/{total_pages}\n\n"
+        + "\n\n".join(lines)
+        + "\n\n👆 Нажми на номер, чтобы послушать • 💔 — убрать из избранного"
     )
     play_rows = num_buttons(ids)
     unfav_btns = [
-        InlineKeyboardButton(text=f"💔#{r['id']}", callback_data=f"unfav_f_{r['id']}_{page}")
-        for r in res
+        InlineKeyboardButton(text=f"💔 {i + 1}", callback_data=f"unfav_f_{r['id']}_{page}")
+        for i, r in enumerate(res)
     ]
     unfav_rows = [unfav_btns[i:i+5] for i in range(0, len(unfav_btns), 5)]
     nav = []
@@ -736,14 +749,17 @@ async def show_playlist_page(pid: int, user_id: int, page: int, target, edit: bo
             "SELECT COUNT(*) FROM playlist_tracks WHERE playlist_id=$1", pid
         )
         if total == 0:
-            text = f"📋 «{html.escape(pl['name'])}» пуст."
+            text = (
+                f"📋 <b>«{html.escape(pl['name'])}»</b> пока пуст\n\n"
+                "Открой любой трек и нажми «➕ В плейлист», чтобы добавить его сюда."
+            )
             if edit:
                 try:
-                    await target.message.edit_text(text)
+                    await target.message.edit_text(text, parse_mode="HTML")
                 except Exception:
-                    await target.message.answer(text)
+                    await target.message.answer(text, parse_mode="HTML")
             else:
-                await target.message.answer(text)
+                await target.message.answer(text, parse_mode="HTML")
             return
         offset = page * PL_TRACK_PAGE_SIZE
         res = await conn.fetch(
@@ -755,18 +771,16 @@ async def show_playlist_page(pid: int, user_id: int, page: int, target, edit: bo
         )
     total_pages = math.ceil(total / PL_TRACK_PAGE_SIZE)
     ids = [r['id'] for r in res]
-    lines = [
-        f"{i + 1 + offset}. {html.escape(format_track(r['artist'], r['title']))}"
-        for i, r in enumerate(res)
-    ]
+    lines = [track_line(i, r['artist'], r['title']) for i, r in enumerate(res)]
     h = (
-        f"📋 «{html.escape(pl['name'])}» — {total} тр. • Стр. {page + 1}/{total_pages}\n\n"
-        + "\n".join(lines)
+        f"📋 <b>«{html.escape(pl['name'])}»</b> · {total} тр. · стр. {page + 1}/{total_pages}\n\n"
+        + "\n\n".join(lines)
+        + "\n\n👆 Нажми на номер, чтобы послушать • 🗑 — убрать из плейлиста"
     )
     play_rows = num_buttons(ids)
     rm_btns = [
-        InlineKeyboardButton(text=f"🗑#{r['id']}", callback_data=f"rmpl_{pid}_{r['id']}_{page}")
-        for r in res
+        InlineKeyboardButton(text=f"🗑 {i + 1}", callback_data=f"rmpl_{pid}_{r['id']}_{page}")
+        for i, r in enumerate(res)
     ]
     rm_rows = [rm_btns[i:i+5] for i in range(0, len(rm_btns), 5)]
     nav = []
@@ -822,6 +836,23 @@ async def check_sub_cb(cb: types.CallbackQuery):
         except Exception:
             pass
 
+HELP_TEXT = (
+    "🎧 <b>Музыкальный бот</b>\n\n"
+    "Слушай треки из канала прямо в чате, собирай избранное и плейлисты.\n\n"
+    "🔍 <b>Поиск</b> — название или исполнитель (по-русски или латиницей)\n"
+    "🎲 <b>Случайный</b> — удиви меня\n"
+    "🔥 <b>Топ</b> — самые популярные треки\n"
+    "🆕 <b>Новое</b> — свежие добавления\n"
+    "❤️ <b>Избранное</b> — твоя коллекция\n"
+    "📋 <b>Плейлисты</b> — до {max_pl} штук, свои названия\n"
+    "💝 <b>Донат</b> — поддержать бота звёздами\n\n"
+    "Просто напиши запрос в чат — я найду трек 👇"
+)
+
+@dp.message(Command("help"))
+async def help_cmd(m: types.Message):
+    await m.answer(HELP_TEXT.format(max_pl=MAX_PLAYLISTS), reply_markup=menu, parse_mode="HTML")
+
 @dp.message(Command("start"))
 async def start_cmd(m: types.Message, state: FSMContext):
     await state.clear()
@@ -852,7 +883,12 @@ async def start_cmd(m: types.Message, state: FSMContext):
                 parse_mode="HTML"
             )
             return
-    await m.answer("🎧 Бот запущен", reply_markup=menu)
+    name = html.escape(m.from_user.first_name or "друг")
+    await m.answer(
+        f"👋 Привет, <b>{name}</b>!\n\n" + HELP_TEXT.format(max_pl=MAX_PLAYLISTS),
+        reply_markup=menu,
+        parse_mode="HTML"
+    )
 
 @dp.message(RequestForm.waiting_text, F.text & ~F.text.startswith("/"))
 async def request_text_handler(m: types.Message, state: FSMContext):
@@ -940,7 +976,7 @@ async def _send_random_track(target, user_id: int, query: str = ""):
                 f"SELECT MIN(id) AS mn, MAX(id) AS mx FROM tracks{' WHERE ' + query if query else ''}"
             )
             if not bounds or bounds['mx'] is None:
-                text = "❌ База пуста" if not query else "❌ Нет треков"
+                text = "📭 В базе пока нет треков" if not query else "📭 Подходящих треков нет"
                 if isinstance(target, types.Message):
                     await target.answer(text)
                 else:
@@ -975,7 +1011,12 @@ async def rnd(m: types.Message):
 @dp.message(F.text == "🔍 Поиск")
 async def sb(m: types.Message, state: FSMContext):
     await state.clear()
-    await m.answer("🔍 Пиши запрос:")
+    await m.answer(
+        "🔍 <b>Поиск</b>\n\n"
+        "Напиши название трека или имя исполнителя.\n"
+        "Работает и по-русски, и латиницей.",
+        parse_mode="HTML"
+    )
 
 @dp.message(F.text == "❤️ Избранное")
 async def sf(m: types.Message):
@@ -999,16 +1040,23 @@ async def top(m: types.Message):
     pool = await get_db()
     try:
         async with pool.acquire() as conn:
-            res = await conn.fetch("SELECT artist, title, plays FROM tracks ORDER BY plays DESC LIMIT 10")
+            res = await conn.fetch("SELECT id, artist, title, plays FROM tracks ORDER BY plays DESC LIMIT 10")
         if not res:
-            await m.answer("❌ Пусто")
+            await m.answer("📭 Топ пока пуст — послушай пару треков, и он появится")
             return
-        medals = ["🥇","🥈","🥉"]
-        lines = [
-            f"{medals[i-1] if i<=3 else f'{i}.'} {html.escape(format_track(t['artist'], t['title']))} — {t['plays']} 🎧"
-            for i, t in enumerate(res, 1)
-        ]
-        await m.answer("🔥 <b>Топ:</b>\n\n" + "\n".join(lines), parse_mode="HTML")
+        medals = ["🥇", "🥈", "🥉"]
+        lines = []
+        for i, t in enumerate(res):
+            block = track_line(i, t['artist'], t['title'], extra=f"{t['plays']} 🎧")
+            if i < 3:
+                block = block.replace(DIGITS[i], medals[i], 1)
+            lines.append(block)
+        ids = [t['id'] for t in res]
+        await m.answer(
+            "🔥 <b>Топ треков</b>\n\n" + "\n\n".join(lines) + "\n\n👆 Нажми на номер, чтобы послушать",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=num_buttons(ids)),
+            parse_mode="HTML"
+        )
     except Exception as e:
         logging.error(f"Ошибка в top: {e}")
 
@@ -1020,16 +1068,20 @@ async def new_tracks(m: types.Message):
                 "SELECT id, title, artist, created_at FROM tracks ORDER BY created_at DESC LIMIT 10"
             )
         if not res:
-            await m.answer("❌ Пусто")
+            await m.answer("📭 Новых треков пока нет")
             return
         lines = [
-            f"{i}. {html.escape(format_track(r['artist'], r['title']))} — <i>{r['created_at'].strftime('%d.%m.%Y')}</i>"
-            for i, r in enumerate(res, 1)
+            track_line(i, r['artist'], r['title'], extra=f"<i>{r['created_at'].strftime('%d.%m.%Y')}</i>")
+            for i, r in enumerate(res)
         ]
         ids = [r['id'] for r in res]
         kb_rows = num_buttons(ids)
         kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
-        await m.answer("🆕 <b>Новинки:</b>\n\n" + "\n".join(lines), reply_markup=kb, parse_mode="HTML")
+        await m.answer(
+            "🆕 <b>Новинки</b>\n\n" + "\n\n".join(lines) + "\n\n👆 Нажми на номер, чтобы послушать",
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
     except Exception as e:
         logging.error(f"Ошибка в new_tracks: {e}")
 
@@ -1103,27 +1155,37 @@ async def spl(m: types.Message, state: FSMContext):
         ]
         if count < MAX_PLAYLISTS:
             rows.append([InlineKeyboardButton(
-                text=f"➕ Создать ({count}/{MAX_PLAYLISTS})", callback_data="plnew"
+                text=f"➕ Создать плейлист ({count}/{MAX_PLAYLISTS})", callback_data="plnew"
             )])
         else:
             rows.append([InlineKeyboardButton(
-                text=f"⛔ Лимит {MAX_PLAYLISTS} плейлиста достигнут", callback_data="noop"
+                text=f"⛔ Лимит: {MAX_PLAYLISTS} плейлистов", callback_data="noop"
             )])
-        await m.answer("📋 Плейлисты:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        if count:
+            text = (
+                f"📋 <b>Твои плейлисты</b> · {count}/{MAX_PLAYLISTS}\n\n"
+                "Нажми на плейлист, чтобы открыть, или 🗑, чтобы удалить."
+            )
+        else:
+            text = (
+                "📋 <b>Плейлистов пока нет</b>\n\n"
+                "Создай первый — и добавляй в него любимые треки."
+            )
+        await m.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
     except Exception as e:
         logging.error(f"Ошибка в spl: {e}")
 
 @dp.callback_query(F.data == "plnew")
 async def cpn(c: types.CallbackQuery, state: FSMContext):
     await state.set_state(PlaylistForm.waiting_name)
-    await c.message.answer("✏️ Название:")
+    await c.message.answer("✏️ Как назвать плейлист? Напиши название (до 50 символов)")
     await c.answer()
 
 @dp.message(PlaylistForm.waiting_name)
 async def rpn(m: types.Message, state: FSMContext):
     n = m.text.strip()
     if not n or len(n) > 50:
-        await m.answer("❌ От 1 до 50 симв.")
+        await m.answer("❌ Название должно быть от 1 до 50 символов. Попробуй ещё раз")
         return
     pool = await get_db()
     try:
@@ -1137,7 +1199,7 @@ async def rpn(m: types.Message, state: FSMContext):
                 return
             await conn.execute("INSERT INTO playlists (user_id, name) VALUES ($1, $2)", m.from_user.id, n)
         await state.clear()
-        await m.answer(f"✅ «{html.escape(n)}» создан!")
+        await m.answer(f"✅ Плейлист <b>«{html.escape(n)}»</b> создан!", parse_mode="HTML")
     except Exception as e:
         logging.error(f"Ошибка в rpn: {e}")
 
@@ -1151,7 +1213,7 @@ async def dpl(c: types.CallbackQuery):
                 await c.answer("❌", show_alert=True)
                 return
             await conn.execute("DELETE FROM playlists WHERE id=$1", pid)
-        await c.answer("🗑 Удален", show_alert=True)
+        await c.answer("🗑 Плейлист удалён")
         try: await c.message.delete()
         except: pass
     except Exception as e:
@@ -1191,7 +1253,7 @@ async def cpl(c: types.CallbackQuery):
             [InlineKeyboardButton(text=f"📋 {p['name']}", callback_data=f"apl_{p['id']}_{tid}")]
             for p in pls
         ])
-        await c.message.answer("Выбери:", reply_markup=kb)
+        await c.message.answer("📋 <b>В какой плейлист добавить?</b>", reply_markup=kb, parse_mode="HTML")
         await c.answer()
     except Exception as e:
         logging.error(f"Ошибка в cpl: {e}")
@@ -1207,7 +1269,7 @@ async def apl(c: types.CallbackQuery):
                 "INSERT INTO playlist_tracks (playlist_id, track_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
                 pid, tid
             )
-        await c.answer("✅ Добавлено", show_alert=True)
+        await c.answer("✅ Добавлено в плейлист")
         try: await c.message.delete()
         except: pass
     except Exception as e:
@@ -1225,7 +1287,7 @@ async def rmpl(c: types.CallbackQuery):
                 "DELETE FROM playlist_tracks WHERE playlist_id=$1 AND track_id=$2",
                 pid, tid
             )
-        await c.answer("🗑 Убрано", show_alert=True)
+        await c.answer("🗑 Убрано из плейлиста")
         await show_playlist_page(pid, c.from_user.id, page, c, edit=True)
     except Exception as e:
         logging.error(f"Ошибка в rmpl: {e}")
@@ -1275,7 +1337,7 @@ async def fav(c: types.CallbackQuery):
                 "INSERT INTO favorites (user_id, track_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
                 c.from_user.id, tid
             )
-        await c.answer("❤️ Добавлено в избранное", show_alert=True)
+        await c.answer("❤️ Добавлено в избранное")
         try:
             await c.message.edit_reply_markup(reply_markup=await track_keyboard(tid, c.from_user.id))
         except: pass
@@ -1295,7 +1357,7 @@ async def unfav(c: types.CallbackQuery):
                     "DELETE FROM favorites WHERE user_id=$1 AND track_id=$2",
                     c.from_user.id, tid
                 )
-            await c.answer("💔 Убрано из избранного", show_alert=True)
+            await c.answer("💔 Убрано из избранного")
             await show_fav_page(c.from_user.id, page, c, edit=True)
         else:
             tid = int(parts[1])
@@ -1305,7 +1367,7 @@ async def unfav(c: types.CallbackQuery):
                     "DELETE FROM favorites WHERE user_id=$1 AND track_id=$2",
                     c.from_user.id, tid
                 )
-            await c.answer("💔 Убрано из избранного", show_alert=True)
+            await c.answer("💔 Убрано из избранного")
             try:
                 await c.message.edit_reply_markup(reply_markup=await track_keyboard(tid, c.from_user.id))
             except: pass
@@ -1347,12 +1409,9 @@ async def rec_cmd(c: types.CallbackQuery):
             await c.answer("Похожих треков нет", show_alert=True)
             return
         ids = [r['id'] for r in recs]
-        lines = [
-            f"{i + 1}. {html.escape(format_track(r['artist'], r['title']))}"
-            for i, r in enumerate(recs)
-        ]
+        lines = [track_line(i, r['artist'], r['title']) for i, r in enumerate(recs)]
         title_str = html.escape(format_track(track['artist'], track['title']))
-        h = f"🎵 <b>Похожие на «{title_str}»:</b>\n\n" + "\n".join(lines)
+        h = f"🎵 <b>Похожие на «{title_str}»</b>\n\n" + "\n\n".join(lines)
         kb = InlineKeyboardMarkup(inline_keyboard=num_buttons(ids))
         await c.message.answer(h, reply_markup=kb, parse_mode="HTML")
         await c.answer()
@@ -1566,6 +1625,16 @@ def build_search_keyboard(query: str, offset: int, total: int) -> InlineKeyboard
     rows.append([InlineKeyboardButton(text=f"Страница {current_page} из {total_pages}", callback_data="noop")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+def build_search_text(query: str, total: int, offset: int, res) -> str:
+    total_pages = math.ceil(total / PAGE_SIZE)
+    current_page = offset // PAGE_SIZE + 1
+    lines = [track_line(i, r['artist'], r['title']) for i, r in enumerate(res)]
+    return (
+        f"🔍 <b>«{html.escape(query[:50])}»</b> · найдено {total} · стр. {current_page}/{total_pages}\n\n"
+        + "\n\n".join(lines)
+        + "\n\n👆 Нажми на номер, чтобы послушать"
+    )
+
 @dp.message(F.chat.type == "private", F.text & ~F.text.startswith("/") & ~F.text.in_({"🔍 Поиск","🎲 Случайный","🔥 Топ","🆕 Новое","❤️ Избранное","📋 Список Плейлистов","💝 Донат","⭐️ Купить Stars"}))
 async def search(m: types.Message, state: FSMContext):
     cur = await state.get_state()
@@ -1573,14 +1642,17 @@ async def search(m: types.Message, state: FSMContext):
         return
     q = m.text.strip()
     if not q: return
+    await bot.send_chat_action(m.chat.id, ChatAction.TYPING)
     res, total = await run_search(q, offset=0)
     if total == 0:
-        await m.answer("❌ Ничего не найдено")
+        await m.answer(
+            f"😕 По запросу <b>«{html.escape(q[:50])}»</b> ничего не нашлось.\n\n"
+            "Попробуй другое написание, часть названия или только имя исполнителя.",
+            parse_mode="HTML"
+        )
         return
     ids = [r['id'] for r in res]
-    lines = [f"{i+1}. {html.escape(format_track(r['artist'], r['title']))}" for i, r in enumerate(res)]
-    total_pages = math.ceil(total / PAGE_SIZE)
-    h = f"🔍 Найдено {total} • Страница 1 из {total_pages}\n\n" + "\n".join(lines)
+    h = build_search_text(q, total, 0, res)
     kb_rows = num_buttons(ids)
     nav_kb = build_search_keyboard(q, 0, total)
     kb_rows += nav_kb.inline_keyboard
@@ -1606,10 +1678,7 @@ async def page_nav(c: types.CallbackQuery):
             await c.answer("❌ Страница не найдена", show_alert=True)
             return
         ids = [r['id'] for r in res]
-        lines = [f"{i+1}. {html.escape(format_track(r['artist'], r['title']))}" for i, r in enumerate(res)]
-        total_pages = math.ceil(total / PAGE_SIZE)
-        current_page = offset // PAGE_SIZE + 1
-        h = f"🔍 Найдено {total} • Страница {current_page} из {total_pages}\n\n" + "\n".join(lines)
+        h = build_search_text(q, total, offset, res)
         kb_rows = num_buttons(ids)
         nav_kb = build_search_keyboard(q, offset, total)
         kb_rows += nav_kb.inline_keyboard
@@ -3064,6 +3133,15 @@ async def main():
         logging.info(f"✅ Bot username: @{BOT_USERNAME}")
     except Exception as e:
         logging.error(f"❌ Не удалось получить username бота: {e}")
+
+    try:
+        await bot.set_my_commands([
+            BotCommand(command="start", description="🏠 Главное меню"),
+            BotCommand(command="help", description="❓ Что умеет бот"),
+            BotCommand(command="cancel", description="❌ Отменить текущее действие"),
+        ])
+    except Exception as e:
+        logging.warning(f"Не удалось установить список команд: {e}")
 
     full_url = webhook_url.rstrip("/") + WEBHOOK_PATH
     try:
