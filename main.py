@@ -546,7 +546,8 @@ DIGITS = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣",
 async def log_play(conn, track_id: int, user_id):
     """Считает прослушивание: общий счётчик + запись в журнал (для топа по периодам).
     Сбой журнала не должен ломать воспроизведение."""
-    await conn.execute("UPDATE tracks SET plays=plays+1 WHERE id=$1", track_id)
+    # COALESCE: если в старой базе у трека plays = NULL, обычный plays+1 так и остался бы NULL
+    await conn.execute("UPDATE tracks SET plays=COALESCE(plays,0)+1 WHERE id=$1", track_id)
     try:
         await conn.execute(
             "INSERT INTO track_plays (track_id, user_id) VALUES ($1, $2)", track_id, user_id
@@ -1119,6 +1120,18 @@ async def _top_rows(period: str):
             f"ORDER BY cnt DESC, t.id LIMIT 10"
         )
 
+async def _top_total(period: str) -> int:
+    """Сколько всего прослушиваний за период — меняется после каждого прослушивания."""
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        interval = TOP_PERIODS[period][2]
+        if interval is None:
+            return int(await conn.fetchval("SELECT COALESCE(SUM(plays),0) FROM tracks") or 0)
+        return int(await conn.fetchval(
+            f"SELECT COUNT(*) FROM track_plays "
+            f"WHERE played_at >= CURRENT_TIMESTAMP - INTERVAL '{interval}'"
+        ) or 0)
+
 def _top_period_row(active: str):
     return [
         InlineKeyboardButton(
@@ -1140,10 +1153,11 @@ async def build_top(period: str, fallback_to_all: bool = False):
             note = "\n<i>Статистика по неделям только начала копиться — пока показан топ за всё время.</i>"
     title = f"🔥 <b>Топ треков</b> · {TOP_PERIODS[period][1]}"
     period_row = _top_period_row(period)
+    refresh_row = [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"top_{period}")]
     if not res:
         return (
             f"{title}\n\n📭 За этот период прослушиваний пока нет — послушай пару треков, и они появятся здесь.",
-            InlineKeyboardMarkup(inline_keyboard=[period_row])
+            InlineKeyboardMarkup(inline_keyboard=[period_row, refresh_row])
         )
     medals = ["🥇", "🥈", "🥉"]
     lines = []
@@ -1153,8 +1167,14 @@ async def build_top(period: str, fallback_to_all: bool = False):
             block = block.replace(DIGITS[i], medals[i], 1)
         lines.append(block)
     ids = [t['id'] for t in res]
-    text = title + "\n\n" + "\n\n".join(lines) + "\n\n👆 Нажми на номер, чтобы послушать" + note
-    kb = InlineKeyboardMarkup(inline_keyboard=num_buttons(ids) + [period_row])
+    total = await _top_total(period)
+    text = (
+        title + "\n\n" + "\n\n".join(lines)
+        + f"\n\n📊 Всего прослушиваний {TOP_PERIODS[period][1]}: <b>{total}</b>"
+        + "\n👆 Нажми на номер, чтобы послушать"
+        + note
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=num_buttons(ids) + [period_row, refresh_row])
     return text, kb
 
 @dp.message(F.text == "🔥 Топ")
@@ -1175,9 +1195,13 @@ async def top_period_cb(c: types.CallbackQuery):
         text, kb = await build_top(period)
         try:
             await c.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-        except Exception:
-            pass  # «message is not modified» при повторном нажатии на ту же вкладку
-        await c.answer()
+            await c.answer("🔄 Обновлено")
+        except Exception as e:
+            if "not modified" in str(e).lower():
+                await c.answer("Пока без изменений — новых прослушиваний нет")
+            else:
+                logging.warning(f"Не удалось обновить сообщение топа: {e}")
+                await c.answer()
     except Exception as e:
         logging.error(f"Ошибка в top_period_cb: {e}")
         await c.answer("❌ Ошибка", show_alert=True)
