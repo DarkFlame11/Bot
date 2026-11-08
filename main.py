@@ -16,7 +16,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, LabeledPrice, PreCheckoutQuery, BotCommand
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, LabeledPrice, PreCheckoutQuery, BotCommand, InlineQueryResultCachedAudio, InlineQueryResultsButton
 from aiogram.enums import ChatAction
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -501,6 +501,18 @@ async def init_db():
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_track_plays_track ON track_plays (track_id, played_at DESC)"
         )
+        # Поисковые запросы, по которым ничего не нашлось (команда /missed для админа)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS missed_searches (
+                id BIGSERIAL PRIMARY KEY,
+                query TEXT NOT NULL,
+                user_id BIGINT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_missed_searches_time ON missed_searches (created_at DESC)"
+        )
         logging.info("✅ База данных инициализирована")
 
 # --- СОСТОЯНИЯ ---
@@ -678,7 +690,7 @@ def _search_query_parts(variants):
     score_expr = ' + '.join(score_terms) if score_terms else '0'
     return where_expr, score_expr, params, p
 
-async def run_search(query, offset=0):
+async def run_search(query, offset=0, limit=None):
     async with db_pool.acquire() as conn:
         var = get_var(query)
         if not var:
@@ -693,7 +705,7 @@ async def run_search(query, offset=0):
                 f"ORDER BY score DESC, plays DESC, id DESC "
                 f"LIMIT ${p} OFFSET ${p+1}"
             )
-            params.extend([PAGE_SIZE, offset])
+            params.extend([limit or PAGE_SIZE, offset])
             rows = await conn.fetch(sql, *params)
             total = rows[0]['total'] if rows else 0
             return rows, int(total)
@@ -1675,16 +1687,67 @@ async def topusers_cmd(m: types.Message):
             return
         lines = []
         for i, r in enumerate(res, 1):
-            name = html.escape(r['first_name'] or "")
+            name = html.escape(r['first_name'] or "без имени")
             uname = f" (@{r['username']})" if r['username'] else ""
             seen = r['last_seen'].strftime('%d.%m.%y') if r['last_seen'] else "—"
             lines.append(
                 f"{i}. <b>{name}</b>{html.escape(uname)}\n"
+                f"   🆔 <code>{r['user_id']}</code>\n"
                 f"   ❤️ {r['fav_count']} • 📋 {r['pl_count']} • 🕐 {seen}"
             )
-        await m.answer("👥 <b>Топ пользователей по избранному:</b>\n\n" + "\n\n".join(lines), parse_mode="HTML")
+        await m.answer(
+            "👥 <b>Топ пользователей по избранному:</b>\n\n" + "\n\n".join(lines)
+            + "\n\n💡 Нажми на ID, чтобы скопировать (например, для /block)",
+            parse_mode="HTML"
+        )
     except Exception as e:
         logging.error(f"Ошибка в topusers_cmd: {e}")
+
+@dp.message(Command("missed"))
+async def missed_cmd(m: types.Message):
+    """Что искали, но не нашли (за 30 дней). `/missed clear` — очистить список."""
+    if m.from_user.id != ADMIN_ID:
+        return
+    args = (m.text or "").split(maxsplit=1)
+    arg = args[1].strip().lower() if len(args) > 1 else ""
+    try:
+        async with db_pool.acquire() as conn:
+            if arg == "clear":
+                n = await conn.fetchval(
+                    "WITH d AS (DELETE FROM missed_searches RETURNING 1) SELECT COUNT(*) FROM d"
+                )
+                await m.answer(f"🧹 Список очищен: удалено записей {n}")
+                return
+            rows = await conn.fetch(
+                "SELECT query, COUNT(*) AS cnt, COUNT(DISTINCT user_id) AS users "
+                "FROM missed_searches "
+                "WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '30 days' "
+                "GROUP BY query ORDER BY cnt DESC, MAX(created_at) DESC LIMIT 20"
+            )
+            total = await conn.fetchval(
+                "SELECT COUNT(*) FROM missed_searches "
+                "WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '30 days'"
+            )
+        if not rows:
+            await m.answer(
+                "🔎 <b>Пустых запросов нет</b>\n\nЕсли пользователи будут искать то, чего нет в базе, "
+                "список появится здесь.",
+                parse_mode="HTML"
+            )
+            return
+        lines = [
+            f"{i}. <b>{html.escape(r['query'])}</b> — {r['cnt']}× · {r['users']} чел."
+            for i, r in enumerate(rows, 1)
+        ]
+        await m.answer(
+            f"🔎 <b>Искали, но не нашли</b> (30 дней, всего {total})\n\n" + "\n".join(lines)
+            + "\n\nДобавь эти треки в канал — и запросы начнут находиться.\n"
+            "Очистить список: <code>/missed clear</code>",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logging.error(f"Ошибка в missed_cmd: {e}")
+        await m.answer("❌ Не удалось получить список")
 
 @dp.message(Command("broadcast"))
 async def broadcast_cmd(m: types.Message, state: FSMContext):
@@ -1763,6 +1826,21 @@ def build_search_keyboard(query: str, offset: int, total: int) -> InlineKeyboard
     rows.append([InlineKeyboardButton(text=f"Страница {current_page} из {total_pages}", callback_data="noop")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+async def log_missed_search(query: str, user_id):
+    """Запоминает запрос без результатов — для админской команды /missed."""
+    if user_id == ADMIN_ID:
+        return  # тестовые запросы админа не засоряют статистику
+    q = " ".join(query.lower().split())[:100]
+    if not q:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO missed_searches (query, user_id) VALUES ($1, $2)", q, user_id
+            )
+    except Exception as e:
+        logging.warning(f"Не удалось записать пустой запрос: {e}")
+
 def build_search_text(query: str, total: int, offset: int, res) -> str:
     total_pages = math.ceil(total / PAGE_SIZE)
     current_page = offset // PAGE_SIZE + 1
@@ -1783,6 +1861,7 @@ async def search(m: types.Message, state: FSMContext):
     await bot.send_chat_action(m.chat.id, ChatAction.TYPING)
     res, total = await run_search(q, offset=0)
     if total == 0:
+        await log_missed_search(q, m.from_user.id)
         await m.answer(
             f"😕 По запросу <b>«{html.escape(q[:50])}»</b> ничего не нашлось.\n\n"
             "Попробуй другое написание, часть названия или только имя исполнителя.",
@@ -1796,6 +1875,98 @@ async def search(m: types.Message, state: FSMContext):
     kb_rows += nav_kb.inline_keyboard
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     await m.answer(h, reply_markup=kb, parse_mode="HTML")
+
+# --- INLINE-РЕЖИМ: @бот название в любом чате ---
+INLINE_PAGE = 20
+INLINE_SUB_TTL = 30.0
+INLINE_SUB_CACHE: dict[int, float] = {}
+
+async def _inline_allowed(user_id: int) -> bool:
+    """Подписка нужна и в inline-режиме. Успех кешируется на 30 с, иначе get_chat_member
+    вызывался бы на каждую набранную букву."""
+    if user_id == ADMIN_ID:
+        return True
+    now = asyncio.get_event_loop().time()
+    ts = INLINE_SUB_CACHE.get(user_id)
+    if ts is not None and now - ts < INLINE_SUB_TTL:
+        return True
+    if await is_subscribed(user_id):
+        if len(INLINE_SUB_CACHE) > 5000:
+            INLINE_SUB_CACHE.clear()
+        INLINE_SUB_CACHE[user_id] = now
+        return True
+    INLINE_SUB_CACHE.pop(user_id, None)
+    return False
+
+@dp.inline_query()
+async def inline_search(iq: types.InlineQuery):
+    try:
+        if not await _inline_allowed(iq.from_user.id):
+            await iq.answer(
+                [], cache_time=5, is_personal=True,
+                button=InlineQueryResultsButton(
+                    text="🔒 Только для подписчиков — открыть бота", start_parameter="sub"
+                ),
+            )
+            return
+        q = (iq.query or "").strip()
+        offset = int(iq.offset) if iq.offset and iq.offset.isdigit() else 0
+        ids: list[int] = []
+        if q:
+            rows, _ = await run_search(q, offset=offset, limit=INLINE_PAGE)
+            ids = [r['id'] for r in rows]
+        async with db_pool.acquire() as conn:
+            if not q:
+                # Пустой запрос — показываем самые популярные треки
+                top = await conn.fetch(
+                    "SELECT id FROM tracks ORDER BY plays DESC NULLS LAST, id LIMIT $1 OFFSET $2",
+                    INLINE_PAGE, offset
+                )
+                ids = [r['id'] for r in top]
+            files = {}
+            if ids:
+                frows = await conn.fetch(
+                    "SELECT id, file_id FROM tracks WHERE id = ANY($1::int[])", ids
+                )
+                files = {r['id']: r['file_id'] for r in frows if r['file_id']}
+        markup = None
+        if BOT_USERNAME:
+            markup = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🎧 Больше музыки в боте", url=f"https://t.me/{BOT_USERNAME}")
+            ]])
+        results = [
+            InlineQueryResultCachedAudio(id=str(tid), audio_file_id=files[tid], reply_markup=markup)
+            for tid in ids if tid in files
+        ]
+        next_offset = str(offset + INLINE_PAGE) if len(ids) == INLINE_PAGE else ""
+        button = None
+        if not results and offset == 0:
+            button = InlineQueryResultsButton(
+                text="😕 Ничего не нашлось — открыть бота", start_parameter="none"
+            )
+        await iq.answer(
+            results, cache_time=10, is_personal=True, next_offset=next_offset, button=button
+        )
+    except Exception as e:
+        logging.error(f"Ошибка inline-поиска: {e}")
+        try:
+            await iq.answer([], cache_time=1, is_personal=True)
+        except Exception:
+            pass
+
+@dp.chosen_inline_result()
+async def inline_chosen(res: types.ChosenInlineResult):
+    """Считает прослушивание, когда трек отправили через inline.
+    Приходит только если в @BotFather включён /setinlinefeedback."""
+    try:
+        tid = int(res.result_id)
+    except (TypeError, ValueError):
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            await log_play(conn, tid, res.from_user.id)
+    except Exception as e:
+        logging.warning(f"Не удалось засчитать inline-прослушивание: {e}")
 
 @dp.callback_query(F.data == "noop")
 async def noop(c: types.CallbackQuery):
@@ -3293,6 +3464,8 @@ async def main():
         "channel_post",
         "pre_checkout_query",
         "chat_member",
+        "inline_query",
+        "chosen_inline_result",
     ]
     await bot.set_webhook(
         url=full_url,
