@@ -901,16 +901,8 @@ HELP_TEXT = (
     "💝 <b>Донат</b> — поддержать бота звёздами\n"
     "━━━━━━━━━━━━━━\n\n"
     "Просто напиши запрос в чат — и я найду трек 👇\n"
-    "⌨️ Команды: /start · /help · /cancel"
+    "⌨️ Команды: /start · /cancel"
 )
-
-@dp.message(Command("help"))
-async def help_cmd(m: types.Message):
-    await m.answer(
-        HELP_TEXT.format(max_pl=MAX_PLAYLISTS) + "\n\n" + random_tip(),
-        reply_markup=menu,
-        parse_mode="HTML"
-    )
 
 @dp.message(Command("start"))
 async def start_cmd(m: types.Message, state: FSMContext):
@@ -3283,7 +3275,6 @@ async def main():
     try:
         await bot.set_my_commands([
             BotCommand(command="start", description="🏠 Главное меню"),
-            BotCommand(command="help", description="❓ Что умеет бот"),
             BotCommand(command="cancel", description="❌ Отменить текущее действие"),
         ])
     except Exception as e:
