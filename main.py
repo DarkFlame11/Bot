@@ -3546,7 +3546,8 @@ async def main():
     app.router.add_get("/health", health_check)
 
     webapp_enabled = False
-    if register_webapp is not None:
+    # Mini App выключен по умолчанию. Включить: переменная MINIAPP=1
+    if register_webapp is not None and os.environ.get("MINIAPP", "0").strip() == "1":
         webapp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webapp")
         if os.path.isfile(os.path.join(webapp_dir, "index.html")):
             webapp_kwargs = dict(
