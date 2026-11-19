@@ -3549,7 +3549,7 @@ async def main():
     if register_webapp is not None:
         webapp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webapp")
         if os.path.isfile(os.path.join(webapp_dir, "index.html")):
-            register_webapp(
+            webapp_kwargs = dict(
                 app=app,
                 dp=dp,
                 bot=bot,
@@ -3565,8 +3565,21 @@ async def main():
                 log_play=log_play,
                 log_missed=log_missed_search,
             )
-            webapp_enabled = True
-            logging.info("✅ Mini App подключён: /app")
+            # Если рядом лежит старый webapp_api.py, передаём только то, что он принимает.
+            # Сбой Mini App не должен останавливать бота.
+            try:
+                import inspect
+                params = inspect.signature(register_webapp).parameters
+                if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+                    skipped = [k for k in webapp_kwargs if k not in params]
+                    if skipped:
+                        logging.warning(f"webapp_api.py устарел, не поддерживает: {', '.join(skipped)}")
+                    webapp_kwargs = {k: v for k, v in webapp_kwargs.items() if k in params}
+                register_webapp(**webapp_kwargs)
+                webapp_enabled = True
+                logging.info("✅ Mini App подключён: /app")
+            except Exception as e:
+                logging.error(f"❌ Mini App не подключён, бот работает без него: {e}")
         else:
             logging.warning("Mini App отключён: нет папки webapp/index.html рядом с main.py")
 
