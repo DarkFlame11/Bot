@@ -16,10 +16,17 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, LabeledPrice, PreCheckoutQuery, BotCommand, InlineQueryResultCachedAudio, InlineQueryResultsButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, LabeledPrice, PreCheckoutQuery, BotCommand, InlineQueryResultCachedAudio, InlineQueryResultsButton, MenuButtonWebApp, WebAppInfo
 from aiogram.enums import ChatAction
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
+
+# Mini App (плеер). Если файла webapp_api.py нет рядом с main.py — бот работает как раньше, без плеера.
+try:
+    from webapp_api import register_webapp
+except ImportError as _webapp_err:
+    register_webapp = None
+    logging.warning(f"Mini App отключён: не удалось импортировать webapp_api ({_webapp_err})")
 
 # --- НАСТРОЙКИ ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -42,7 +49,11 @@ if not DATABASE_URL:
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-USE_SSL = "railway" in DATABASE_URL or os.environ.get("DB_SSL", "").lower() == "true"
+# Внутренний адрес Railway (*.railway.internal) работает без SSL; внешний (proxy.rlwy.net) и прочие — с SSL
+USE_SSL = (
+    ("railway" in DATABASE_URL and ".railway.internal" not in DATABASE_URL)
+    or os.environ.get("DB_SSL", "").lower() == "true"
+)
 
 session = AiohttpSession(timeout=60)
 bot = Bot(token=BOT_TOKEN, session=session)
@@ -660,39 +671,135 @@ def _esc_like(s: str) -> str:
     """Экранирует спецсимволы LIKE/ILIKE."""
     return s.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
 
+# Раскладки клавиатуры: «ghbdtn» -> «привет» и обратно
+_EN_TO_RU = {e: r for e, r in zip("qwertyuiopasdfghjklzxcvbnm", "йцукенгшщзфывапролдячсмить")}
+_EN_TO_RU.update({"[": "х", "]": "ъ", ";": "ж", "'": "э", ",": "б", ".": "ю", "`": "ё"})
+_RU_TO_EN = {r: e for e, r in _EN_TO_RU.items()}
+
+def _norm_query(q: str) -> str:
+    """Нижний регистр, ё->е, без пунктуации и лишних пробелов:
+    «ARTIK & ASTI — Лампочки» -> «artik asti лампочки»."""
+    q = (q or "").lower()
+    for z in ("​", "‌", "‍"):
+        q = q.replace(z, "")
+    q = q.replace("ё", "е")
+    q = re.sub(r"['’`]", "", q)        # don't -> dont
+    q = re.sub(r"[^\w\s]|_", " ", q)        # & - – , . ( ) и т.п. -> пробел
+    return re.sub(r"\s+", " ", q).strip()
+
+def get_search_var(q):
+    """Варианты запроса для поиска: как набрано, транслит, неверная раскладка."""
+    base = _norm_query(q)
+    if len(base) < 2:        # одна буква находит пол-базы — не ищем
+        return []
+    v = [base]
+    letters = [c for c in base if c.isalpha()]
+    only_lat = bool(letters) and all(c.isascii() for c in letters)
+    only_cyr = bool(letters) and all(0x0400 <= ord(c) <= 0x04FF for c in letters)
+    if only_cyr:
+        for fn in (translit_to_latin, translit_to_latin_simple):
+            x = fn(base)
+            if x and x not in v:
+                v.append(x)
+        x = "".join(_RU_TO_EN.get(c, c) for c in base)      # «утшьут» -> «eminem»
+        if x not in v:
+            v.append(x)
+    elif only_lat:
+        x = translit_to_cyrillic(base)
+        if x and x not in v:
+            v.append(x)
+        x = "".join(_EN_TO_RU.get(c, c) for c in base)      # «ghbdtn» -> «привет»
+        if x not in v:
+            v.append(x)
+    return v[:5]
+
+# Строка для поиска: «исполнитель название», нижний регистр, ё->е, без апострофов
+HAY_SQL = (
+    "replace(replace(translate(lower(COALESCE(artist,'') || ' ' || COALESCE(title,'')), 'ё', 'е'),"
+    " '''', ''), '’', '')"
+)
+
+def _tokens(v: str):
+    toks = v.split()
+    if len(toks) > 1:
+        long_ = [t for t in toks if len(t) > 1]   # одиночные буквы («а», «и») ничего не значат
+        toks = long_ or toks
+    return toks[:6]
+
 def _search_query_parts(variants):
-    """Собирает части SQL для поиска по треку/артисту с ранжированием.
-    Возвращает (where_expr, score_expr, params, next_param_index).
-    На каждый вариант запроса генерирует 3 параметра (exact, prefix, substring)
-    и оценивает релевантность: точное совпадение > префикс > подстрока,
-    название важнее исполнителя.
+    """Собирает части SQL для поиска. Возвращает (where_expr, score_expr, params, next_param_index).
+    Запрос разбивается на слова: каждое слово должно встретиться в «исполнитель + название»,
+    порядок слов и поле не важны («артик асти лампочки» найдёт «ARTIK & ASTI – Лампочки»).
+    Каждое слово проверяется во всех вариантах (как набрано / транслит / раскладка), поэтому
+    строки со смешанным алфавитом тоже находятся.
+    Ранжирование: точное совпадение > начало > слова в названии > слова у исполнителя.
     """
-    where = []
-    score_terms = []
-    params = []
+    score_terms, params = [], []
     p = 1
     for v in variants:
         v_esc = _esc_like(v)
         params.extend([v_esc, v_esc + '%', '%' + v_esc + '%'])
         i_exact, i_prefix, i_substr = p, p + 1, p + 2
         p += 3
-        where.append(f"title ILIKE ${i_substr}")
-        where.append(f"artist ILIKE ${i_substr}")
+        bonus = []
+        for t in _tokens(v):
+            params.append('%' + _esc_like(t) + '%')
+            bonus.append(f"CASE WHEN title ILIKE ${p} THEN 10 ELSE 0 END")
+            bonus.append(f"CASE WHEN artist ILIKE ${p} THEN 8 ELSE 0 END")
+            p += 1
         score_terms.append(
-            f"(CASE WHEN title  ILIKE ${i_exact}  THEN 100 ELSE 0 END"
+            f"(CASE WHEN {HAY_SQL} ILIKE ${i_substr} THEN 20 ELSE 0 END"
+            f" + CASE WHEN title  ILIKE ${i_exact}  THEN 100 ELSE 0 END"
             f" + CASE WHEN artist ILIKE ${i_exact}  THEN 80  ELSE 0 END"
             f" + CASE WHEN title  ILIKE ${i_prefix} THEN 30  ELSE 0 END"
             f" + CASE WHEN artist ILIKE ${i_prefix} THEN 25  ELSE 0 END"
             f" + CASE WHEN title  ILIKE ${i_substr} THEN 5   ELSE 0 END"
-            f" + CASE WHEN artist ILIKE ${i_substr} THEN 4   ELSE 0 END)"
+            f" + CASE WHEN artist ILIKE ${i_substr} THEN 4   ELSE 0 END"
+            + (" + " + " + ".join(bonus) if bonus else "") + ")"
         )
-    where_expr = ' OR '.join(where) if where else 'FALSE'
+    # WHERE: для каждого слова — «совпало в любом варианте», все слова обязательны
+    split = [v.split() for v in variants]
+    conds = []
+    if split and all(len(x) == len(split[0]) for x in split):
+        keep = [i for i, t in enumerate(split[0]) if t in _tokens(variants[0])] or list(range(len(split[0])))
+        for i in keep[:6]:
+            alts = []
+            for x in split:
+                if x[i] not in alts:
+                    alts.append(x[i])
+            ors = []
+            for t in alts:
+                params.append('%' + _esc_like(t) + '%')
+                ors.append(f"{HAY_SQL} ILIKE ${p}")
+                p += 1
+            conds.append("(" + " OR ".join(ors) + ")")
+        where_expr = " AND ".join(conds) if conds else "FALSE"
+    else:
+        parts = []
+        for v in variants:
+            cs = []
+            for t in _tokens(v):
+                params.append('%' + _esc_like(t) + '%')
+                cs.append(f"{HAY_SQL} ILIKE ${p}")
+                p += 1
+            if cs:
+                parts.append("(" + " AND ".join(cs) + ")")
+        where_expr = " OR ".join(parts) if parts else "FALSE"
     score_expr = ' + '.join(score_terms) if score_terms else '0'
     return where_expr, score_expr, params, p
 
+FUZZY_MIN = 0.45   # порог похожести для поиска с опечатками (0..1)
+
+def _fuzzy_query_parts(variants):
+    """Поиск с опечатками через pg_trgm: «лампочкм» -> «Лампочки».
+    Возвращает (выражение похожести, параметры, следующий номер параметра)."""
+    params = list(variants)
+    sims = ", ".join(f"word_similarity(${i + 1}, {HAY_SQL})" for i in range(len(params)))
+    return f"GREATEST({sims})", params, len(params) + 1
+
 async def run_search(query, offset=0, limit=None):
     async with db_pool.acquire() as conn:
-        var = get_var(query)
+        var = get_search_var(query)
         if not var:
             return [], 0
         try:
@@ -707,8 +814,22 @@ async def run_search(query, offset=0, limit=None):
             )
             params.extend([limit or PAGE_SIZE, offset])
             rows = await conn.fetch(sql, *params)
-            total = rows[0]['total'] if rows else 0
-            return rows, int(total)
+            if rows:
+                return rows, int(rows[0]['total'])
+            # Точных совпадений нет: ищем «примерно то же» (опечатки)
+            if len(var[0]) >= 4:
+                sim_expr, fparams, fp = _fuzzy_query_parts(var)
+                sql = (
+                    f"SELECT id, title, artist, COUNT(*) OVER() AS total "
+                    f"FROM (SELECT id, title, artist, plays, ({sim_expr}) AS sim FROM tracks) sub "
+                    f"WHERE sim >= {FUZZY_MIN} "
+                    f"ORDER BY sim DESC, plays DESC, id DESC "
+                    f"LIMIT ${fp} OFFSET ${fp+1}"
+                )
+                fparams.extend([limit or PAGE_SIZE, offset])
+                rows = await conn.fetch(sql, *fparams)
+                if rows:
+                    return rows, int(rows[0]['total'])
         except Exception as e:
             logging.error(f"❌ Ошибка поиска: {e}")
     return [], 0
@@ -903,6 +1024,7 @@ HELP_TEXT = (
     "Слушай треки из канала прямо в чате.\n\n"
     "━━━━━━━━━━━━━━\n"
     "🎵 <b>Музыка</b>\n"
+    "🎧 <b>Плеер</b> — кнопка слева от поля ввода: приложение с очередью и перемоткой\n"
     "🔍 <b>Поиск</b> — название или исполнитель, по-русски или латиницей\n"
     "🎲 <b>Случайный</b> — удиви меня\n"
     "🔥 <b>Топ</b> — что слушают: неделя, месяц, всё время\n"
@@ -2007,7 +2129,7 @@ async def mg_cmd(m: types.Message):
         pool = await get_db()
         async with pool.acquire() as conn:
             if query:
-                var = get_var(query)
+                var = get_search_var(query)
                 if not var:
                     await m.answer("❌ Пустой запрос")
                     return
@@ -3423,6 +3545,31 @@ async def main():
     app.router.add_get("/", health_check)
     app.router.add_get("/health", health_check)
 
+    webapp_enabled = False
+    if register_webapp is not None:
+        webapp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webapp")
+        if os.path.isfile(os.path.join(webapp_dir, "index.html")):
+            register_webapp(
+                app=app,
+                dp=dp,
+                bot=bot,
+                db_pool_getter=lambda: db_pool,
+                bot_token=BOT_TOKEN,
+                is_subscribed=_inline_allowed,   # та же проверка подписки на канал (кеш 30 с)
+                run_search=run_search,
+                format_track=format_track,
+                track_keyboard=track_keyboard,
+                num_buttons=num_buttons,
+                static_dir=webapp_dir,
+                max_playlists=MAX_PLAYLISTS,
+                log_play=log_play,
+                log_missed=log_missed_search,
+            )
+            webapp_enabled = True
+            logging.info("✅ Mini App подключён: /app")
+        else:
+            logging.warning("Mini App отключён: нет папки webapp/index.html рядом с main.py")
+
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
 
@@ -3442,6 +3589,18 @@ async def main():
         logging.info(f"✅ Bot username: @{BOT_USERNAME}")
     except Exception as e:
         logging.error(f"❌ Не удалось получить username бота: {e}")
+
+    if webapp_enabled:
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(webhook_url)
+            webapp_url = os.environ.get("WEBAPP_URL", "").strip() or f"{parsed.scheme}://{parsed.netloc}/app"
+            await bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(text="🎵 Плеер", web_app=WebAppInfo(url=webapp_url))
+            )
+            logging.info(f"✅ Кнопка меню «Плеер» → {webapp_url}")
+        except Exception as e:
+            logging.warning(f"Не удалось установить кнопку меню Mini App: {e}")
 
     try:
         await bot.set_my_commands([
