@@ -26,7 +26,7 @@ try:
     from webapp_api import register_webapp
 except ImportError as _webapp_err:
     register_webapp = None
-    logging.warning(f"Mini App отключён: не удалось импортировать webapp_api ({_webapp_err})")
+    logging.info(f"Mini App не подключён ({_webapp_err})")
 
 # --- НАСТРОЙКИ ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -1124,7 +1124,6 @@ HELP_TEXT = (
     "Слушай треки из канала прямо в чате.\n\n"
     "━━━━━━━━━━━━━━\n"
     "🎵 <b>Музыка</b>\n"
-    "🎧 <b>Плеер</b> — кнопка слева от поля ввода: приложение с очередью и перемоткой\n"
     "🔍 <b>Поиск</b> — название или исполнитель, по-русски или латиницей\n"
     "🎲 <b>Случайный</b> — удиви меня\n"
     "🔥 <b>Топ</b> — что слушают: неделя, месяц, всё время\n"
@@ -1134,8 +1133,7 @@ HELP_TEXT = (
     "📋 <b>Плейлисты</b> — до {max_pl} своих подборок\n"
     "💝 <b>Донат</b> — поддержать бота звёздами\n"
     "━━━━━━━━━━━━━━\n\n"
-    "Просто напиши запрос в чат — и я найду трек 👇\n"
-    "⌨️ Команды: /start · /cancel"
+    "Просто напиши запрос в чат — и я найду трек 👇"
 )
 
 @dp.message(Command("start"))
@@ -3719,7 +3717,6 @@ async def main():
     try:
         await bot.set_my_commands([
             BotCommand(command="start", description="🏠 Главное меню"),
-            BotCommand(command="cancel", description="❌ Отменить текущее действие"),
         ])
     except Exception as e:
         logging.warning(f"Не удалось установить список команд: {e}")
