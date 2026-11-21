@@ -714,9 +714,10 @@ def get_search_var(q):
     return v[:5]
 
 # Строка для поиска: «исполнитель название», нижний регистр, ё->е, без апострофов
+_PUNCT = '&-–—()[]{}.,!?:;"«»/\\|+*#@~^=<>'
 HAY_SQL = (
-    "replace(replace(translate(lower(COALESCE(artist,'') || ' ' || COALESCE(title,'')), 'ё', 'е'),"
-    " '''', ''), '’', '')"
+    "translate(replace(replace(translate(lower(COALESCE(artist,'') || ' ' || COALESCE(title,'')), 'ё', 'е'),"
+    " '''', ''), '’', ''), '" + _PUNCT.replace("'", "''") + "', '" + " " * len(_PUNCT) + "')"
 )
 
 def _tokens(v: str):
@@ -726,8 +727,10 @@ def _tokens(v: str):
         toks = long_ or toks
     return toks[:6]
 
-def _search_query_parts(variants):
+def _search_query_parts(variants, wordstart=True):
     """Собирает части SQL для поиска. Возвращает (where_expr, score_expr, params, next_param_index).
+    wordstart=True: слово запроса должно быть НАЧАЛОМ слова («плам» найдёт «Пламя», но не «Лампа»);
+    wordstart=False: слово может быть где угодно внутри (запасной вариант).
     Запрос разбивается на слова: каждое слово должно встретиться в «исполнитель + название»,
     порядок слов и поле не важны («артик асти лампочки» найдёт «ARTIK & ASTI – Лампочки»).
     Каждое слово проверяется во всех вариантах (как набрано / транслит / раскладка), поэтому
@@ -769,8 +772,8 @@ def _search_query_parts(variants):
                     alts.append(x[i])
             ors = []
             for t in alts:
-                params.append('%' + _esc_like(t) + '%')
-                ors.append(f"{HAY_SQL} ILIKE ${p}")
+                params.append(('% ' if wordstart else '%') + _esc_like(t) + '%')
+                ors.append(f"(' ' || {HAY_SQL}) ILIKE ${p}")
                 p += 1
             conds.append("(" + " OR ".join(ors) + ")")
         where_expr = " AND ".join(conds) if conds else "FALSE"
@@ -779,8 +782,8 @@ def _search_query_parts(variants):
         for v in variants:
             cs = []
             for t in _tokens(v):
-                params.append('%' + _esc_like(t) + '%')
-                cs.append(f"{HAY_SQL} ILIKE ${p}")
+                params.append(('% ' if wordstart else '%') + _esc_like(t) + '%')
+                cs.append(f"(' ' || {HAY_SQL}) ILIKE ${p}")
                 p += 1
             if cs:
                 parts.append("(" + " AND ".join(cs) + ")")
@@ -788,13 +791,15 @@ def _search_query_parts(variants):
     score_expr = ' + '.join(score_terms) if score_terms else '0'
     return where_expr, score_expr, params, p
 
-FUZZY_MIN = 0.45   # порог похожести для поиска с опечатками (0..1)
+# Настройки поиска с опечатками. Менять можно переменными окружения, без правки кода.
+FUZZY_MIN = float(os.environ.get("SEARCH_FUZZY_MIN", "0.5"))         # порог похожести (0..1): выше = строже
+FUZZY_MIN_LEN = int(os.environ.get("SEARCH_FUZZY_MIN_LEN", "5"))     # короче этого опечатки не ищем
 
 def _fuzzy_query_parts(variants):
     """Поиск с опечатками через pg_trgm: «лампочкм» -> «Лампочки».
     Возвращает (выражение похожести, параметры, следующий номер параметра)."""
     params = list(variants)
-    sims = ", ".join(f"word_similarity(${i + 1}, {HAY_SQL})" for i in range(len(params)))
+    sims = ", ".join(f"strict_word_similarity(${i + 1}, {HAY_SQL})" for i in range(len(params)))
     return f"GREATEST({sims})", params, len(params) + 1
 
 async def run_search(query, offset=0, limit=None):
@@ -803,26 +808,30 @@ async def run_search(query, offset=0, limit=None):
         if not var:
             return [], 0
         try:
-            where_expr, score_expr, params, p = _search_query_parts(var)
-            sql = (
-                f"SELECT id, title, artist, COUNT(*) OVER() AS total "
-                f"FROM (SELECT id, title, artist, plays, "
-                f"             ({score_expr}) AS score "
-                f"      FROM tracks WHERE {where_expr}) sub "
-                f"ORDER BY score DESC, plays DESC, id DESC "
-                f"LIMIT ${p} OFFSET ${p+1}"
-            )
-            params.extend([limit or PAGE_SIZE, offset])
-            rows = await conn.fetch(sql, *params)
-            if rows:
-                return rows, int(rows[0]['total'])
-            # Точных совпадений нет: ищем «примерно то же» (опечатки)
-            if len(var[0]) >= 4:
+            # 1) слово с начала слова; 2) если пусто, слово где угодно внутри; 3) опечатки
+            for wordstart in (True, False):
+                where_expr, score_expr, params, p = _search_query_parts(var, wordstart=wordstart)
+                sql = (
+                    f"SELECT id, title, artist, COUNT(*) OVER() AS total "
+                    f"FROM (SELECT id, title, artist, plays, "
+                    f"             ({score_expr}) AS score "
+                    f"      FROM tracks WHERE {where_expr}) sub "
+                    f"ORDER BY score DESC, plays DESC, id DESC "
+                    f"LIMIT ${p} OFFSET ${p+1}"
+                )
+                params.extend([limit or PAGE_SIZE, offset])
+                rows = await conn.fetch(sql, *params)
+                if rows:
+                    return rows, int(rows[0]['total'])
+            # Совпадений нет: ищем «примерно то же» (опечатки). Короткие слова дают много ложных
+            # совпадений, поэтому для них порог выше, а совсем короткие не ищем.
+            if len(var[0]) >= FUZZY_MIN_LEN:
+                fuzzy_min = FUZZY_MIN
                 sim_expr, fparams, fp = _fuzzy_query_parts(var)
                 sql = (
                     f"SELECT id, title, artist, COUNT(*) OVER() AS total "
                     f"FROM (SELECT id, title, artist, plays, ({sim_expr}) AS sim FROM tracks) sub "
-                    f"WHERE sim >= {FUZZY_MIN} "
+                    f"WHERE sim >= {fuzzy_min} "
                     f"ORDER BY sim DESC, plays DESC, id DESC "
                     f"LIMIT ${fp} OFFSET ${fp+1}"
                 )
