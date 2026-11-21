@@ -720,17 +720,28 @@ HAY_SQL = (
     " '''', ''), '’', ''), '" + _PUNCT.replace("'", "''") + "', '" + " " * len(_PUNCT) + "')"
 )
 
+# Слова, которые люди добавляют к запросу, но которых нет в названиях («мияги песня пламя»)
+SEARCH_STOPWORDS = {
+    "песня", "песню", "песни", "песен", "трек", "трека", "треки", "музыка", "музыку", "музыки",
+    "скачать", "слушать", "послушать", "найти", "найди", "пожалуйста", "плиз", "хочу", "новая", "новую",
+    "song", "songs", "track", "music", "mp3", "download", "listen", "full", "official",
+}
+
 def _tokens(v: str):
     toks = v.split()
+    if len(toks) > 1:
+        real = [t for t in toks if t not in SEARCH_STOPWORDS]
+        toks = real or toks
     if len(toks) > 1:
         long_ = [t for t in toks if len(t) > 1]   # одиночные буквы («а», «и») ничего не значат
         toks = long_ or toks
     return toks[:6]
 
-def _search_query_parts(variants, wordstart=True):
+def _search_query_parts(variants, wordstart=True, partial=False):
     """Собирает части SQL для поиска. Возвращает (where_expr, score_expr, params, next_param_index).
     wordstart=True: слово запроса должно быть НАЧАЛОМ слова («плам» найдёт «Пламя», но не «Лампа»);
     wordstart=False: слово может быть где угодно внутри (запасной вариант).
+    partial=True: достаточно, чтобы совпали все слова, кроме одного (лишнее слово в запросе не мешает).
     Запрос разбивается на слова: каждое слово должно встретиться в «исполнитель + название»,
     порядок слов и поле не важны («артик асти лампочки» найдёт «ARTIK & ASTI – Лампочки»).
     Каждое слово проверяется во всех вариантах (как набрано / транслит / раскладка), поэтому
@@ -776,7 +787,15 @@ def _search_query_parts(variants, wordstart=True):
                 ors.append(f"(' ' || {HAY_SQL}) ILIKE ${p}")
                 p += 1
             conds.append("(" + " OR ".join(ors) + ")")
-        where_expr = " AND ".join(conds) if conds else "FALSE"
+        if partial:
+            if len(conds) >= 2:
+                hits = " + ".join(f"({c})::int" for c in conds)
+                where_expr = f"({hits}) >= {len(conds) - 1}"
+                score_terms.append(f"(({hits}) * 15)")
+            else:
+                where_expr = "FALSE"
+        else:
+            where_expr = " AND ".join(conds) if conds else "FALSE"
     else:
         parts = []
         for v in variants:
@@ -808,9 +827,11 @@ async def run_search(query, offset=0, limit=None):
         if not var:
             return [], 0
         try:
-            # 1) слово с начала слова; 2) если пусто, слово где угодно внутри; 3) опечатки
-            for wordstart in (True, False):
-                where_expr, score_expr, params, p = _search_query_parts(var, wordstart=wordstart)
+            # 1) слово с начала слова; 2) слово где угодно внутри; 3) все слова, кроме одного; 4) опечатки
+            for wordstart, partial in ((True, False), (False, False), (True, True)):
+                where_expr, score_expr, params, p = _search_query_parts(var, wordstart=wordstart, partial=partial)
+                if where_expr == "FALSE":
+                    continue
                 sql = (
                     f"SELECT id, title, artist, COUNT(*) OVER() AS total "
                     f"FROM (SELECT id, title, artist, plays, "
