@@ -466,6 +466,20 @@ async def init_db():
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tracks_artist_trgm ON tracks USING GIN (artist gin_trgm_ops)"
         )
+        # Столбец для быстрого поиска (нужен PostgreSQL 12+). Если не получилось, поиск работает и без него.
+        global HAY_SQL
+        try:
+            await conn.execute(
+                f"ALTER TABLE tracks ADD COLUMN IF NOT EXISTS search_text text GENERATED ALWAYS AS ({_HAY_EXPR}) STORED"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tracks_search_trgm ON tracks USING GIN (search_text gin_trgm_ops)"
+            )
+            HAY_SQL = "search_text"
+            logging.info("✅ Быстрый поиск: столбец search_text")
+        except Exception as e:
+            HAY_SQL = _HAY_EXPR
+            logging.warning(f"Быстрый поиск недоступен, считаем на лету: {e}")
         await conn.execute(
             "ALTER TABLE vote_sessions ADD COLUMN IF NOT EXISTS closes_at TIMESTAMP"
         )
@@ -704,6 +718,22 @@ def get_search_var(q):
         x = "".join(_RU_TO_EN.get(c, c) for c in base)      # «утшьут» -> «eminem»
         if x not in v:
             v.append(x)
+    elif letters and not only_lat and not only_cyr:
+        # смешанный запрос: каждое слово приводим к одному алфавиту
+        def _is_cyr(w):
+            return any(0x0400 <= ord(c) <= 0x04FF for c in w)
+        all_cyr = " ".join(w if _is_cyr(w) else translit_to_cyrillic(w) for w in base.split())
+        all_lat = " ".join(translit_to_latin(w) if _is_cyr(w) else w for w in base.split())
+        # слово с латинской буквой внутри кириллического («Мoт» с латинской o) -> всё кириллицей
+        _homo = {"a": "а", "c": "с", "e": "е", "o": "о", "p": "р", "x": "х", "y": "у", "k": "к", "m": "м", "t": "т", "h": "н", "b": "в"}
+        def _fix(w):
+            if _is_cyr(w) and any(c.isascii() and c.isalpha() for c in w):
+                return "".join(_homo.get(c, c) for c in w)
+            return w
+        homo = " ".join(_fix(w) for w in base.split())
+        for x in (all_cyr, all_lat, homo):
+            if x and x not in v:
+                v.append(x)
     elif only_lat:
         x = translit_to_cyrillic(base)
         if x and x not in v:
@@ -715,10 +745,13 @@ def get_search_var(q):
 
 # Строка для поиска: «исполнитель название», нижний регистр, ё->е, без апострофов
 _PUNCT = '&-–—()[]{}.,!?:;"«»/\\|+*#@~^=<>'
-HAY_SQL = (
-    "translate(replace(replace(translate(lower(COALESCE(artist,'') || ' ' || COALESCE(title,'')), 'ё', 'е'),"
-    " '''', ''), '’', ''), '" + _PUNCT.replace("'", "''") + "', '" + " " * len(_PUNCT) + "')"
+_HAY_EXPR = (
+    "(' ' || translate(replace(replace(translate(lower(COALESCE(artist,'') || ' ' || COALESCE(title,'')), 'ё', 'е'),"
+    " '''', ''), '’', ''), '" + _PUNCT.replace("'", "''") + "', '" + " " * len(_PUNCT) + "'))"
 )
+# По умолчанию считаем на лету. Если в базе получилось создать столбец search_text (см. init_db),
+# используем его: он считается один раз при записи и ускоряет поиск через индекс.
+HAY_SQL = _HAY_EXPR
 
 # Слова, которые люди добавляют к запросу, но которых нет в названиях («мияги песня пламя»)
 SEARCH_STOPWORDS = {
@@ -737,7 +770,7 @@ def _tokens(v: str):
         toks = long_ or toks
     return toks[:6]
 
-def _search_query_parts(variants, wordstart=True, partial=False):
+def _search_query_parts(variants, wordstart=True, partial=False, focus=None):
     """Собирает части SQL для поиска. Возвращает (where_expr, score_expr, params, next_param_index).
     wordstart=True: слово запроса должно быть НАЧАЛОМ слова («плам» найдёт «Пламя», но не «Лампа»);
     wordstart=False: слово может быть где угодно внутри (запасной вариант).
@@ -784,13 +817,16 @@ def _search_query_parts(variants, wordstart=True, partial=False):
             ors = []
             for t in alts:
                 params.append(('% ' if wordstart else '%') + _esc_like(t) + '%')
-                ors.append(f"(' ' || {HAY_SQL}) ILIKE ${p}")
+                ors.append(f"{HAY_SQL} ILIKE ${p}")
                 p += 1
             conds.append("(" + " OR ".join(ors) + ")")
         if partial:
             if len(conds) >= 2:
                 hits = " + ".join(f"({c})::int" for c in conds)
-                where_expr = f"({hits}) >= {len(conds) - 1}"
+                if focus is not None and 0 <= focus < len(conds):
+                    where_expr = conds[focus]          # только самое редкое слово запроса
+                else:
+                    where_expr = f"({hits}) >= {len(conds) - 1}"
                 score_terms.append(f"(({hits}) * 15)")
             else:
                 where_expr = "FALSE"
@@ -802,7 +838,7 @@ def _search_query_parts(variants, wordstart=True, partial=False):
             cs = []
             for t in _tokens(v):
                 params.append(('% ' if wordstart else '%') + _esc_like(t) + '%')
-                cs.append(f"(' ' || {HAY_SQL}) ILIKE ${p}")
+                cs.append(f"{HAY_SQL} ILIKE ${p}")
                 p += 1
             if cs:
                 parts.append("(" + " AND ".join(cs) + ")")
@@ -811,6 +847,32 @@ def _search_query_parts(variants, wordstart=True, partial=False):
     return where_expr, score_expr, params, p
 
 # Настройки поиска с опечатками. Менять можно переменными окружения, без правки кода.
+async def _rarest_token(conn, var):
+    """Номер самого редкого слова запроса (среди тех, что вообще есть в базе).
+    «мияги приятная»: «мияги» у десятков треков, «приятная» у одного, значит нужно показать «Приятная»."""
+    split = [v.split() for v in var]
+    if not split or not all(len(x) == len(split[0]) for x in split):
+        return None
+    base_tokens = _tokens(var[0])
+    keep = [i for i, t in enumerate(split[0]) if t in base_tokens] or list(range(len(split[0])))
+    keep = keep[:6]
+    if len(keep) < 2:
+        return None
+    cols, params = [], []
+    for i in keep:
+        alts = []
+        for x in split:
+            if x[i] not in alts:
+                alts.append(x[i])
+        ors = []
+        for t in alts:
+            params.append('% ' + _esc_like(t) + '%')
+            ors.append(f"{HAY_SQL} ILIKE ${len(params)}")
+        cols.append("COUNT(*) FILTER (WHERE " + " OR ".join(ors) + ")")
+    row = await conn.fetchrow("SELECT " + ", ".join(cols) + " FROM tracks", *params)
+    nonzero = [(c, k) for k, c in enumerate(list(row)) if c > 0]
+    return min(nonzero)[1] if nonzero else None
+
 FUZZY_MIN = float(os.environ.get("SEARCH_FUZZY_MIN", "0.5"))         # порог похожести (0..1): выше = строже
 FUZZY_MIN_LEN = int(os.environ.get("SEARCH_FUZZY_MIN_LEN", "5"))     # короче этого опечатки не ищем
 
@@ -829,7 +891,9 @@ async def run_search(query, offset=0, limit=None):
         try:
             # 1) слово с начала слова; 2) слово где угодно внутри; 3) все слова, кроме одного; 4) опечатки
             for wordstart, partial in ((True, False), (False, False), (True, True)):
-                where_expr, score_expr, params, p = _search_query_parts(var, wordstart=wordstart, partial=partial)
+                focus = await _rarest_token(conn, var) if partial else None
+                where_expr, score_expr, params, p = _search_query_parts(
+                    var, wordstart=wordstart, partial=partial, focus=focus)
                 if where_expr == "FALSE":
                     continue
                 sql = (
@@ -844,6 +908,12 @@ async def run_search(query, offset=0, limit=None):
                 rows = await conn.fetch(sql, *params)
                 if rows:
                     return rows, int(rows[0]['total'])
+                if offset > 0:
+                    # Страница за концом списка. Если эта ступень вообще что-то находит, то следующая
+                    # ступень не нужна: иначе на 2-й странице появились бы чужие результаты.
+                    probe = await conn.fetch(sql, *params[:-2], 1, 0)
+                    if probe:
+                        return [], int(probe[0]['total'])
             # Совпадений нет: ищем «примерно то же» (опечатки). Короткие слова дают много ложных
             # совпадений, поэтому для них порог выше, а совсем короткие не ищем.
             if len(var[0]) >= FUZZY_MIN_LEN:
@@ -2163,7 +2233,7 @@ async def mg_cmd(m: types.Message):
                 if not var:
                     await m.answer("❌ Пустой запрос")
                     return
-                where_expr, score_expr, params, _ = _search_query_parts(var)
+                where_expr, score_expr, params, _ = _search_query_parts(var, wordstart=False)
                 sql = (
                     f"SELECT id, title, artist FROM ("
                     f"  SELECT id, title, artist, plays, ({score_expr}) AS score "
