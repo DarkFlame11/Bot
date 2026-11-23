@@ -2262,8 +2262,54 @@ async def mg_cmd(m: types.Message):
 _MONTHS_RU = ["янв", "фев", "мар", "апр", "май", "июн",
               "июл", "авг", "сен", "окт", "ноя", "дек"]
 
+def _bot_tz():
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(os.environ.get("BOT_TZ", "Asia/Yerevan"))
+    except Exception:
+        return datetime.timezone(datetime.timedelta(hours=int(os.environ.get("BOT_TZ_OFFSET", "4"))))
+
+def _to_local_date(dt_utc_naive) -> datetime.date:
+    """Время из базы (UTC без пояса) -> дата по времени бота."""
+    return dt_utc_naive.replace(tzinfo=datetime.timezone.utc).astimezone(_bot_tz()).date()
+
+def _range_label(start: datetime.date, end: datetime.date) -> str:
+    """22–29 ноя 2026 / 29 ноя – 6 дек 2026 / 22 ноя 2026."""
+    if end <= start:
+        return f"{start.day} {_MONTHS_RU[start.month - 1]} {start.year}"
+    if start.year == end.year and start.month == end.month:
+        return f"{start.day}–{end.day} {_MONTHS_RU[start.month - 1]} {end.year}"
+    if start.year == end.year:
+        return f"{start.day} {_MONTHS_RU[start.month - 1]} – {end.day} {_MONTHS_RU[end.month - 1]} {end.year}"
+    return (f"{start.day} {_MONTHS_RU[start.month - 1]} {start.year} – "
+            f"{end.day} {_MONTHS_RU[end.month - 1]} {end.year}")
+
+def _vote_dates_label(vote_type, date_part, created_at, closes_at, closed=False):
+    """Даты голосования по факту: от запуска до закрытия, а не по календарной неделе (пн–вс).
+    Запустили в воскресенье 22 ноября на 168 ч -> «22–29 ноя 2026»."""
+    if vote_type == 'week' and created_at:
+        try:
+            start = _to_local_date(created_at)
+            if closes_at:
+                end_dt = closes_at
+                if closed:
+                    end_dt = min(closes_at, datetime.datetime.utcnow())
+                return _range_label(start, _to_local_date(end_dt))
+            if closed:
+                return _range_label(start, _to_local_date(datetime.datetime.utcnow()))
+            return f"с {start.day} {_MONTHS_RU[start.month - 1]} {start.year}"
+        except Exception:
+            pass
+    return _pretty_vote_date(date_part)
+
+def _local_today() -> datetime.date:
+    """Сегодняшняя дата по времени бота (по умолчанию Ереван, UTC+4), а не по часам сервера (UTC).
+    Иначе с 00:00 до 04:00 в голосовании писалась вчерашняя дата.
+    Настройки: BOT_TZ (например Europe/Moscow); если такой пояс недоступен, BOT_TZ_OFFSET в часах."""
+    return datetime.datetime.now(_bot_tz()).date()
+
 def current_period(vote_type: str) -> str:
-    today = datetime.date.today()
+    today = _local_today()
     if vote_type == 'day':
         return today.strftime("%d.%m.%Y")
     weekday = today.weekday()
@@ -2344,7 +2390,7 @@ def _vote_bar(pct: int, width: int = 10) -> str:
     filled = max(0, min(width, round(pct / 100 * width)))
     return "▰" * filled + "▱" * (width - filled)
 
-def build_vote_text(vote_type: str, period: str, rows, closed=False, closes_at=None) -> str:
+def build_vote_text(vote_type: str, period: str, rows, closed=False, closes_at=None, created_at=None) -> str:
     date_part, artist = _split_period(period)
     if vote_type == 'artist':
         title = f"Лучшие треки — {html.escape(period)}"
@@ -2352,7 +2398,7 @@ def build_vote_text(vote_type: str, period: str, rows, closed=False, closes_at=N
     else:
         label = "дня" if vote_type == 'day' else "недели"
         title = f"Трек {label}" + (f" — {html.escape(artist)}" if artist else "")
-        date_line = f"<i>{html.escape(_pretty_vote_date(date_part))}</i>\n"
+        date_line = f"<i>{html.escape(_vote_dates_label(vote_type, date_part, created_at, closes_at, closed))}</i>\n"
     total = sum(r['vote_count'] for r in rows)
     medals = ["🥇", "🥈", "🥉"]
 
@@ -2472,7 +2518,7 @@ async def _start_vote(m: types.Message, vote_type: str, limit: int, hours: int =
             [(session_id, t['id']) for t in tracks]
         )
     rows = await get_vote_counts(session_id)
-    text = build_vote_text(vote_type, period, rows, closes_at=closes_at)
+    text = build_vote_text(vote_type, period, rows, closes_at=closes_at, created_at=datetime.datetime.utcnow())
     kb = build_vote_keyboard(session_id, rows)
     try:
         msg = await bot.send_message(channel_id, text, parse_mode="HTML", reply_markup=kb)
@@ -2493,7 +2539,8 @@ async def _do_close_vote(session: dict):
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE vote_sessions SET status='closed' WHERE id=$1", session['id'])
     rows = await get_vote_counts(session['id'])
-    text = build_vote_text(session['vote_type'], session['period'], rows, closed=True)
+    text = build_vote_text(session['vote_type'], session['period'], rows, closed=True,
+                           closes_at=session.get('closes_at'), created_at=session.get('created_at'))
     kb = build_vote_keyboard(session['id'], rows, closed=True)
     if session['channel_message_id'] and session['channel_chat_id']:
         try:
@@ -2541,7 +2588,7 @@ async def vote_auto_close_loop():
             async with db_pool.acquire() as conn:
                 expired = await conn.fetch(
                     "SELECT * FROM vote_sessions "
-                    "WHERE status='active' AND closes_at IS NOT NULL AND closes_at <= NOW()"
+                    "WHERE status='active' AND closes_at IS NOT NULL AND closes_at <= (NOW() AT TIME ZONE 'UTC')"
                 )
             for session in expired:
                 logging.info(f"Авто-закрытие голосования #{session['id']} ({session['vote_type']})")
@@ -3030,7 +3077,8 @@ async def handle_vote(c: types.CallbackQuery):
                 session_id, track_id, c.from_user.id
             )
         rows = await get_vote_counts(session_id)
-        text = build_vote_text(session['vote_type'], session['period'], rows, closes_at=session['closes_at'])
+        text = build_vote_text(session['vote_type'], session['period'], rows, closes_at=session['closes_at'],
+                               created_at=session['created_at'])
         kb = build_vote_keyboard(session_id, rows)
         try:
             await c.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
