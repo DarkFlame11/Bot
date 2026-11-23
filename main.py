@@ -16,8 +16,8 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, LabeledPrice, PreCheckoutQuery, BotCommand, InlineQueryResultCachedAudio, InlineQueryResultsButton, MenuButtonWebApp, WebAppInfo
 from aiogram.enums import ChatAction
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, LabeledPrice, PreCheckoutQuery, BotCommand, InlineQueryResultCachedAudio, InlineQueryResultsButton, MenuButtonWebApp, WebAppInfo
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 
@@ -2307,71 +2307,111 @@ def _vote_short_label(vote_type: str, period: str) -> str:
         return vote_type
     return f"{base} — {artist}" if artist else base
 
+def _plural_ru(n: int, forms) -> str:
+    """1 голос, 2 голоса, 5 голосов."""
+    n = abs(int(n))
+    if n % 10 == 1 and n % 100 != 11:
+        return forms[0]
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return forms[1]
+    return forms[2]
+
+def _votes_word(n: int) -> str:
+    return f"{n} {_plural_ru(n, ('голос', 'голоса', 'голосов'))}"
+
+def _pretty_vote_date(date_part: str) -> str:
+    """«24.11.2026» -> «24 ноя 2026». Недельный период («17–23 ноя 2026») уже читаемый."""
+    try:
+        d = datetime.datetime.strptime(date_part, "%d.%m.%Y")
+        return f"{d.day} {_MONTHS_RU[d.month - 1]} {d.year}"
+    except Exception:
+        return date_part
+
+def _time_left_text(closes_at) -> str:
+    secs = (closes_at - datetime.datetime.utcnow()).total_seconds()
+    if secs <= 0:
+        return ""
+    days, rest = divmod(int(secs), 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    if days:
+        return f"{days} дн {hours} ч"
+    if hours:
+        return f"{hours} ч {minutes} мин"
+    return f"{max(minutes, 1)} мин"
+
+def _vote_bar(pct: int, width: int = 10) -> str:
+    filled = max(0, min(width, round(pct / 100 * width)))
+    return "▰" * filled + "▱" * (width - filled)
+
 def build_vote_text(vote_type: str, period: str, rows, closed=False, closes_at=None) -> str:
     date_part, artist = _split_period(period)
     if vote_type == 'artist':
         title = f"Лучшие треки — {html.escape(period)}"
-        period_suffix = ""
+        date_line = ""
     else:
         label = "дня" if vote_type == 'day' else "недели"
-        if artist:
-            title = f"Трек {label} — {html.escape(artist)}"
-        else:
-            title = f"Трек {label}"
-        period_suffix = f" • {date_part}"
-    if closed:
-        header = f"🏆 <b>Результаты голосования — {title}</b>"
-    else:
-        header = f"🗳 <b>Голосование — {title}</b>"
+        title = f"Трек {label}" + (f" — {html.escape(artist)}" if artist else "")
+        date_line = f"<i>{html.escape(_pretty_vote_date(date_part))}</i>\n"
     total = sum(r['vote_count'] for r in rows)
     medals = ["🥇", "🥈", "🥉"]
+
+    def pct_of(r):
+        return round(r['vote_count'] / total * 100) if total > 0 else 0
+
+    def name_of(r):
+        return html.escape(format_track(r['artist'], r['title']))
+
+    # ---------- Итоги ----------
+    if closed:
+        head = f"🏆 <b>Итоги: {title}</b>\n{date_line}".rstrip("\n")
+        if not rows or total == 0:
+            return head + "\n\nГолосов не набралось. В следующий раз будет жарче 🔥"
+        w = rows[0]
+        parts = [
+            head,
+            "👑 <b>Победитель</b>\n"
+            f"<b>{name_of(w)}</b>\n"
+            f"{_vote_bar(pct_of(w))}  {pct_of(w)}% · {_votes_word(w['vote_count'])}",
+        ]
+        rest = []
+        for i, r in enumerate(rows[1:], start=1):
+            mark = medals[i] if i < 3 else f"{i + 1}."
+            rest.append(f"{mark} {name_of(r)} — {_votes_word(r['vote_count'])} ({pct_of(r)}%)")
+        if rest:
+            parts.append("Остальные\n" + "\n".join(rest))
+        parts.append(f"👥 Всего проголосовало: <b>{total}</b>")
+        return "\n\n".join(parts)
+
+    # ---------- Идёт голосование ----------
+    head = f"🗳 <b>{title}</b>\n{date_line}".rstrip("\n")
+    intro = "Выбери трек, который заслуживает победы 🎧"
     lines = []
     for i, r in enumerate(rows):
-        pct = round(r['vote_count'] / total * 100) if total > 0 else 0
-        filled = round(pct / 10)
-        bar = "█" * filled + "░" * (10 - filled)
-        if closed and i == 0:
-            prefix = "🥇"
-        elif closed and i < 3:
-            prefix = medals[i]
-        else:
-            prefix = f"{i + 1}."
-        track_name = html.escape(format_track(r['artist'], r['title']))
-        count_str = f"{r['vote_count']} гол." if r['vote_count'] != 1 else "1 гол."
+        # пока никто не голосовал, медали ничего не значат
+        mark = (medals[i] if i < 3 else f"{i + 1}.") if total > 0 else f"{i + 1}."
         lines.append(
-            f"{prefix} <b>{track_name}</b>\n"
-            f"<code>{bar}</code> {count_str} ({pct}%)"
+            f"{mark} <b>{name_of(r)}</b>\n"
+            f"{_vote_bar(pct_of(r))}  {pct_of(r)}% · {r['vote_count']}"
         )
-    if closed:
-        footer_parts = [f"📊 Всего проголосовало: <b>{total}</b>"]
-        if rows:
-            winner = html.escape(format_track(rows[0]['artist'], rows[0]['title']))
-            footer_parts.append(f"🏅 Победитель: <b>{winner}</b>")
-        footer = "\n".join(footer_parts)
-    else:
-        footer_parts = [f"👥 Проголосовало: <b>{total}</b>"]
-        if closes_at:
-            now = datetime.datetime.utcnow()
-            delta = closes_at - now
-            if delta.total_seconds() > 0:
-                h = int(delta.total_seconds() // 3600)
-                mn = int((delta.total_seconds() % 3600) // 60)
-                footer_parts.append(f"⏰ Закроется через: {h}ч {mn}мин")
-        footer_parts.append("👇🏼 Нажми на кнопку ниже чтобы проголосовать • 1 голос")
-        footer = "\n".join(footer_parts)
-    return f"{header}{period_suffix}\n\n" + "\n\n".join(lines) + f"\n\n{footer}"
+    status = [f"👥 Проголосовало: <b>{total}</b>"]
+    if closes_at:
+        left = _time_left_text(closes_at)
+        if left:
+            status.append(f"⏰ До конца: <b>{left}</b>")
+    foot = " · ".join(status) + "\n👇 Один голос на человека. Жми на кнопку с треком"
+    return head + "\n\n" + intro + "\n\n" + "\n\n".join(lines) + "\n\n" + foot
 
 def build_vote_keyboard(session_id: int, rows, closed=False) -> InlineKeyboardMarkup:
     if closed:
         return InlineKeyboardMarkup(inline_keyboard=[])
-    medals = ["🥇", "🥈", "🥉"]
     total = sum(r['vote_count'] for r in rows)
     buttons = []
-    for i, r in enumerate(rows):
-        pct = round(r['vote_count'] / total * 100) if total > 0 else 0
-        prefix = medals[i] if i < 3 else f"{i + 1}."
-        name = format_track(r['artist'], r['title'])[:30]
-        label = f"{prefix} {name} — {r['vote_count']} ({pct}%)"
+    for r in rows:
+        name = format_track(r['artist'], r['title'])
+        if len(name) > 34:
+            name = name[:33] + "…"
+        label = f"🎧 {name}" + (f"  ·  {r['vote_count']}" if total > 0 else "")
         buttons.append([InlineKeyboardButton(
             text=label,
             callback_data=f"vote_{session_id}_{r['track_id']}"
