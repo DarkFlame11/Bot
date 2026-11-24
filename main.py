@@ -1,6 +1,7 @@
 import os
 import re
 import math
+import time
 import asyncio
 import logging
 import html
@@ -2623,6 +2624,75 @@ async def vote_auto_close_loop():
         except Exception as e:
             logging.error(f"Ошибка в vote_auto_close_loop: {e}")
 
+# ---------- Размер базы данных ----------
+DB_LIMIT_MB = float(os.environ.get("DB_LIMIT_MB", "500"))   # лимит тарифа (Supabase Free = 500 МБ)
+DB_WARN_PCT = 80                                            # предупреждать с этого заполнения
+
+def _fmt_mb(b) -> str:
+    mb = (b or 0) / 1048576
+    return f"{mb:.1f} МБ" if mb < 1024 else f"{mb / 1024:.2f} ГБ"
+
+async def _db_size_info():
+    """Возвращает (размер базы в байтах, [(таблица, размер в байтах, строк)])."""
+    async with db_pool.acquire() as conn:
+        total = await conn.fetchval("SELECT pg_database_size(current_database())")
+        rows = await conn.fetch(
+            "SELECT c.relname AS name, pg_total_relation_size(c.oid) AS size, c.reltuples::bigint AS n "
+            "FROM pg_class c JOIN pg_namespace ns ON ns.oid = c.relnamespace "
+            "WHERE c.relkind = 'r' AND ns.nspname = 'public' "
+            "ORDER BY size DESC LIMIT 6"
+        )
+    return int(total or 0), rows
+
+@dp.message(Command("dbsize"))
+async def dbsize_cmd(m: types.Message):
+    """Админ: сколько места занимает база и сколько осталось до лимита."""
+    if m.from_user.id != ADMIN_ID: return
+    try:
+        total, rows = await _db_size_info()
+    except Exception as e:
+        await m.answer(f"❌ Не удалось получить размер базы: {html.escape(str(e))}")
+        return
+    limit = DB_LIMIT_MB * 1048576
+    pct = total / limit * 100 if limit else 0
+    filled = max(0, min(10, round(pct / 10)))
+    bar = "▰" * filled + "▱" * (10 - filled)
+    icon = "🟢" if pct < 60 else ("🟡" if pct < DB_WARN_PCT else "🔴")
+    lines = [
+        "💾 <b>База данных</b>",
+        "",
+        f"{icon} {bar} <b>{pct:.1f}%</b>",
+        f"Занято: <b>{_fmt_mb(total)}</b> из {DB_LIMIT_MB:g} МБ",
+        f"Свободно: <b>{_fmt_mb(max(limit - total, 0))}</b>",
+        "",
+        "<b>Самые большие таблицы</b>",
+    ]
+    for r in rows:
+        lines.append(f"• {html.escape(r['name'])} — {_fmt_mb(r['size'])} (~{max(r['n'], 0)} строк)")
+    if pct >= DB_WARN_PCT:
+        lines += ["", "⚠️ Место заканчивается. При 100% база станет «только чтение» и записи перестанут работать."]
+    await m.answer("\n".join(lines), parse_mode="HTML")
+
+async def db_size_watch_loop():
+    """Раз в сутки проверяет размер базы и пишет админу, если заполнено ≥ DB_WARN_PCT.
+    Повторное предупреждение — не чаще раза в 3 дня."""
+    last_warn = 0.0
+    await asyncio.sleep(120)
+    while True:
+        try:
+            total, _ = await _db_size_info()
+            pct = total / (DB_LIMIT_MB * 1048576) * 100 if DB_LIMIT_MB else 0
+            if ADMIN_ID and pct >= DB_WARN_PCT and time.time() - last_warn > 3 * 86400:
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ База занята на {pct:.0f}% ({_fmt_mb(total)} из {DB_LIMIT_MB:g} МБ). "
+                    f"Подробнее: /dbsize",
+                )
+                last_warn = time.time()
+        except Exception as e:
+            logging.error(f"Ошибка в db_size_watch_loop: {e}")
+        await asyncio.sleep(86400)
+
 @dp.message(Command("debugenv"))
 async def debug_env(m: types.Message):
     if m.from_user.id != ADMIN_ID: return
@@ -3896,6 +3966,7 @@ async def main():
         logging.info("✅ Webhook проверен — chat_member апдейты включены")
 
     asyncio.create_task(vote_auto_close_loop())
+    asyncio.create_task(db_size_watch_loop())
     logging.info("✅ Авто-закрытие голосований запущено")
 
     # После перезапуска (например, обновления кода) сразу обновляем посты идущих голосований
