@@ -96,6 +96,298 @@ async def register_user(user: types.User):
     except Exception as e:
         logging.error(f"Ошибка регистрации пользователя: {e}")
 
+# --- ЯЗЫКИ (RU / EN) ---
+# Язык берётся из выбора пользователя (users.lang). Если не выбирал — по языку Telegram.
+LANGS = ("ru", "en")
+# Страны, где русский обычно понимают, остаются на русском. Остальным — английский.
+_RU_LIKE = {"ru", "uk", "be", "kk", "ky", "hy", "uz", "tg", "az", "ka", "ro", "mo", "tk"}
+USER_LANG: dict[int, str] = {}
+
+def _auto_lang(code) -> str:
+    code = (code or "").lower().split("-")[0]
+    if not code or code in _RU_LIKE:
+        return "ru"
+    return "en"
+
+def lang_of(user) -> str:
+    """Язык без обращения к базе: из кеша или по языку Telegram."""
+    return USER_LANG.get(user.id) or _auto_lang(getattr(user, "language_code", None))
+
+def L(uid) -> str:
+    return USER_LANG.get(uid, "ru")
+
+async def get_lang(user) -> str:
+    cached = USER_LANG.get(user.id)
+    if cached:
+        return cached
+    lang = None
+    try:
+        async with db_pool.acquire() as conn:
+            lang = await conn.fetchval("SELECT lang FROM users WHERE user_id=$1", user.id)
+    except Exception as e:
+        logging.warning(f"Не удалось прочитать язык пользователя: {e}")
+    if lang not in LANGS:
+        lang = _auto_lang(getattr(user, "language_code", None))
+    if len(USER_LANG) > 50000:
+        USER_LANG.clear()
+    USER_LANG[user.id] = lang
+    return lang
+
+async def set_user_lang(uid: int, lang: str):
+    USER_LANG[uid] = lang
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE users SET lang=$2 WHERE user_id=$1", uid, lang)
+
+STR = {
+"ru": {
+    "err": "❌ Ошибка",
+    # reply-меню
+    "b_search": "🔍 Поиск", "b_random": "🎲 Случайный", "b_top": "🔥 Топ", "b_new": "🆕 Новое",
+    "b_fav": "❤️ Избранное", "b_pl": "📋 Список Плейлистов", "b_donate": "💝 Донат", "b_lang": "🌐 Язык",
+    "placeholder": "🔍 Название трека или исполнитель…",
+    # подписка
+    "gate_text": "🔒 Доступ к боту только для подписчиков канала <b>{title}</b>.\n\nПодпишись и нажми «Я подписался» — и сразу продолжим.",
+    "gate_title": "наш канал", "gate_open": "📢 Открыть канал", "gate_done": "✅ Я подписался",
+    "sub_ok_alert": "✅ Подписка подтверждена!",
+    "sub_ok_msg": "✅ Подписка подтверждена. Жми /start, чтобы начать пользоваться ботом.",
+    "sub_fail": "❌ Подписка не найдена. Подпишись на канал и нажми кнопку ещё раз.",
+    "throttle_cb": "⏳ Слишком часто! Подожди немного.",
+    "throttle_msg": "⏳ Слишком часто! Подожди пару секунд.",
+    # старт
+    "friend": "друг",
+    "greetings": [
+        "👋 Привет, <b>{name}</b>!",
+        "🎶 Рад тебя видеть, <b>{name}</b>!",
+        "🎧 Здравствуй, <b>{name}</b>! Самое время для музыки.",
+        "🔥 О, <b>{name}</b>! Давай найдём что-нибудь крутое.",
+        "✨ Привет, <b>{name}</b>! Что послушаем сегодня?",
+        "🎵 <b>{name}</b>, добро пожаловать! Музыка уже ждёт.",
+    ],
+    "tips": [
+        "Пиши запрос и по-русски, и латиницей — найдётся и так, и так.",
+        "Под каждым треком есть «🎵 Похожие треки» — подборка по исполнителю.",
+        "Нажми «➕ В плейлист» под любым треком, чтобы сохранить его в свою подборку.",
+        "В избранном есть кнопка «🎲 Случайный из избранного» — для настроения.",
+        "В топе можно переключать период: неделя, месяц или всё время.",
+        "Хватит и части названия — искать можно по обрывку слова.",
+        "В 🆕 Новом лежат самые свежие добавления — загляни, чтобы не пропустить новинки.",
+    ],
+    "tip_prefix": "💡 <i>Совет: {tip}</i>",
+    "help": (
+        "🎧 <b>Музыкальный бот</b>\n"
+        "Слушай треки из канала прямо в чате.\n\n"
+        "━━━━━━━━━━━━━━\n"
+        "🎵 <b>Музыка</b>\n"
+        "🔍 <b>Поиск</b> — название или исполнитель, по-русски или латиницей\n"
+        "🎲 <b>Случайный</b> — удиви меня\n"
+        "🔥 <b>Топ</b> — что слушают: неделя, месяц, всё время\n"
+        "🆕 <b>Новое</b> — свежие добавления\n\n"
+        "👤 <b>Твоё</b>\n"
+        "❤️ <b>Избранное</b> — любимые треки\n"
+        "📋 <b>Плейлисты</b> — до {max_pl} своих подборок\n"
+        "💝 <b>Донат</b> — поддержать бота звёздами\n"
+        "🌐 <b>Язык</b> — Русский / English\n"
+        "━━━━━━━━━━━━━━\n\n"
+        "Просто напиши запрос в чат — и я найду трек 👇"
+    ),
+    # язык
+    "lang_choose": "🌐 Выбери язык / Choose your language",
+    "lang_set": "✅ Язык: Русский",
+    # заявки
+    "req_closed": "❌ Сбор заявок уже закрыт. Следи за каналом — будет новый пост.",
+    "req_prompt": "📝 Напиши <b>одним сообщением</b> исполнителя и название трека, который хочешь следующим.\n\nНапример: <code>Eminem — Mockingbird</code>\n\nОтменить — /cancel",
+    "req_empty": "❌ Пусто. Напиши название трека или /cancel",
+    "req_lost": "❌ Сессия потеряна. Попробуй снова через пост в канале.",
+    "req_closed2": "❌ Сбор заявок уже закрыт.",
+    "req_ok": "✅ Заявка принята, спасибо!",
+    "req_full": "❌ Лимит заявок в этой сессии исчерпан. Жди следующего поста.",
+    "req_user_limit": "❌ Ты уже отправил {n} {word} в этой сессии — это максимум.",
+    "req_word_one": "заявку", "req_word_many": "заявки",
+    # случайный / поиск
+    "rnd_db_empty": "📭 В базе пока нет треков", "rnd_no_match": "📭 Подходящих треков нет", "rnd_none": "❌ Нет треков",
+    "search_prompt": "🔍 <b>Поиск</b>\n\nНапиши название трека или имя исполнителя.\nРаботает и по-русски, и латиницей.",
+    "nothing_found": "😕 По запросу <b>«{q}»</b> ничего не нашлось.\n\nПопробуй другое написание, часть названия или только имя исполнителя.",
+    "search_head": "🔍 <b>«{q}»</b> · найдено {total} · стр. {page}/{pages}",
+    "tap_listen": "👆 Нажми на номер, чтобы послушать",
+    "nav_back": "◀️ Назад", "nav_next": "Вперёд ▶️",
+    "page_of": "Страница {p} из {n}", "page_short": "Стр. {p} из {n}",
+    "nf_alert": "❌ Ничего не найдено", "nopage": "❌ Страница не найдена",
+    # избранное
+    "fav_empty": "❤️ <b>Избранное пусто</b>\n\nНайди трек через 🔍 Поиск или 🎲 Случайный и нажми «❤️ В избранное» — он появится здесь.",
+    "fav_head": "❤️ <b>Избранное</b> · {total} тр. · стр. {page}/{pages}",
+    "fav_foot": "👆 Нажми на номер, чтобы послушать • 💔 — убрать из избранного",
+    "fav_random": "🎲 Случайный из избранного",
+    "fav_empty_alert": "❌ Избранное пусто",
+    "fav_added": "❤️ Добавлено в избранное", "fav_removed": "💔 Убрано из избранного",
+    # плейлисты
+    "pl_empty": "📋 <b>«{name}»</b> пока пуст\n\nОткрой любой трек и нажми «➕ В плейлист», чтобы добавить его сюда.",
+    "pl_head": "📋 <b>«{name}»</b> · {total} тр. · стр. {page}/{pages}",
+    "pl_foot": "👆 Нажми на номер, чтобы послушать • 🗑 — убрать из плейлиста",
+    "pl_random": "🎲 Случайный из плейлиста",
+    "pls_new": "➕ Создать плейлист ({c}/{m})", "pls_limit": "⛔ Лимит: {m} плейлистов",
+    "pls_head": "📋 <b>Твои плейлисты</b> · {c}/{m}\n\nНажми на плейлист, чтобы открыть, или 🗑, чтобы удалить.",
+    "pls_none": "📋 <b>Плейлистов пока нет</b>\n\nСоздай первый — и добавляй в него любимые треки.",
+    "pl_ask_name": "✏️ Как назвать плейлист? Напиши название (до 50 символов)",
+    "pl_bad_name": "❌ Название должно быть от 1 до 50 символов. Попробуй ещё раз",
+    "pl_max": "❌ Максимум {m} плейлистов. Удали один перед созданием нового.",
+    "pl_created": "✅ Плейлист <b>«{name}»</b> создан!",
+    "pl_deleted": "🗑 Плейлист удалён", "pl_first": "Сначала создай плейлист",
+    "pl_which": "📋 <b>В какой плейлист добавить?</b>",
+    "pl_added": "✅ Добавлено в плейлист", "pl_removed": "🗑 Убрано из плейлиста",
+    "pl_empty_alert": "❌ Плейлист пуст",
+    # трек
+    "not_found": "❌ Трек не найден",
+    "btn_unfav": "💔 Убрать", "btn_fav": "❤️ В избранное", "btn_addpl": "➕ В плейлист", "btn_similar": "🎵 Похожие треки",
+    "no_similar": "Похожих треков нет", "similar_head": "🎵 <b>Похожие на «{t}»</b>",
+    # топ
+    "top_title": "🔥 <b>Топ треков</b> · {p}",
+    "top_week_btn": "📅 Неделя", "top_month_btn": "🗓 Месяц", "top_all_btn": "🏆 Всё время",
+    "top_week_ttl": "за 7 дней", "top_month_ttl": "за 30 дней", "top_all_ttl": "за всё время",
+    "top_total": "📊 Всего прослушиваний {p}: <b>{n}</b>",
+    "top_note": "Статистика по неделям только начала копиться — пока показан топ за всё время.",
+    "top_none": "📭 За этот период прослушиваний пока нет — послушай пару треков, и они появятся здесь.",
+    "refresh": "🔄 Обновить", "refreshed": "🔄 Обновлено", "nochange": "Пока без изменений — новых прослушиваний нет",
+    "new_none": "📭 Новых треков пока нет", "new_head": "🆕 <b>Новинки</b>",
+    # отмена / донат
+    "cancelled": "❌ Отменено", "nothing_cancel": "Нечего отменять",
+    "don_start": "💝 <b>Поддержать бота</b>\n\nСпасибо, что хочешь помочь! 🙏\nВведи сумму в Telegram Stars ⭐️ (от {a} до {b}).\n\nДля отмены: /cancel",
+    "don_nan": "❌ Введи целое число звёзд, например: <code>50</code>",
+    "don_range": "❌ Сумма должна быть от {a} до {b} ⭐️",
+    "don_title": "Поддержка бота", "don_desc": "Донат {n} ⭐️ на развитие бота", "don_label": "Донат {n} ⭐️",
+    "don_fail": "❌ Не удалось создать счёт. Попробуй позже.",
+    "don_thanks": "💖 <b>Спасибо за поддержку!</b>\n\nТы задонатил <b>{n} ⭐️</b>. Это очень помогает!",
+    # голосование
+    "v_closed": "❌ Голосование уже закрыто", "v_same": "Ты уже голосовал за этот трек",
+    "v_already": "Ты уже проголосовал в этом голосовании", "v_ok": "✅ Голос за «{name}» засчитан!", "v_track": "трек",
+    # inline
+    "inl_sub": "🔒 Только для подписчиков — открыть бота", "inl_more": "🎧 Больше музыки в боте",
+    "inl_none": "😕 Ничего не нашлось — открыть бота",
+},
+"en": {
+    "err": "❌ Error",
+    "b_search": "🔍 Search", "b_random": "🎲 Random", "b_top": "🔥 Top", "b_new": "🆕 New",
+    "b_fav": "❤️ Favorites", "b_pl": "📋 Playlists", "b_donate": "💝 Donate", "b_lang": "🌐 Language",
+    "placeholder": "🔍 Track title or artist…",
+    "gate_text": "🔒 The bot is only for subscribers of the channel <b>{title}</b>.\n\nSubscribe and tap “I subscribed” — and we'll continue right away.",
+    "gate_title": "our channel", "gate_open": "📢 Open channel", "gate_done": "✅ I subscribed",
+    "sub_ok_alert": "✅ Subscription confirmed!",
+    "sub_ok_msg": "✅ Subscription confirmed. Press /start to begin using the bot.",
+    "sub_fail": "❌ Subscription not found. Subscribe to the channel and tap the button again.",
+    "throttle_cb": "⏳ Too fast! Please wait a moment.",
+    "throttle_msg": "⏳ Too fast! Please wait a couple of seconds.",
+    "friend": "friend",
+    "greetings": [
+        "👋 Hi, <b>{name}</b>!",
+        "🎶 Great to see you, <b>{name}</b>!",
+        "🎧 Hello, <b>{name}</b>! Perfect time for some music.",
+        "🔥 Hey <b>{name}</b>! Let's find something cool.",
+        "✨ Hi, <b>{name}</b>! What shall we listen to today?",
+        "🎵 <b>{name}</b>, welcome! The music is already waiting.",
+    ],
+    "tips": [
+        "Search works with Cyrillic and Latin letters — type it either way.",
+        "Under every track there's “🎵 Similar tracks” — a selection by the same artist.",
+        "Tap “➕ Add to playlist” under any track to save it to your own collection.",
+        "Favorites has a “🎲 Random from favorites” button — for when you're in the mood.",
+        "In Top you can switch the period: week, month or all time.",
+        "Part of a title is enough — you can search by a fragment of a word.",
+        "🆕 New has the latest additions — check it so you don't miss new tracks.",
+    ],
+    "tip_prefix": "💡 <i>Tip: {tip}</i>",
+    "help": (
+        "🎧 <b>Music bot</b>\n"
+        "Listen to the channel's tracks right in the chat.\n\n"
+        "━━━━━━━━━━━━━━\n"
+        "🎵 <b>Music</b>\n"
+        "🔍 <b>Search</b> — title or artist, in Cyrillic or Latin letters\n"
+        "🎲 <b>Random</b> — surprise me\n"
+        "🔥 <b>Top</b> — what people listen to: week, month, all time\n"
+        "🆕 <b>New</b> — latest additions\n\n"
+        "👤 <b>Yours</b>\n"
+        "❤️ <b>Favorites</b> — your favorite tracks\n"
+        "📋 <b>Playlists</b> — up to {max_pl} collections\n"
+        "💝 <b>Donate</b> — support the bot with Stars\n"
+        "🌐 <b>Language</b> — Русский / English\n"
+        "━━━━━━━━━━━━━━\n\n"
+        "Just type a query in the chat and I'll find the track 👇"
+    ),
+    "lang_choose": "🌐 Выбери язык / Choose your language",
+    "lang_set": "✅ Language: English",
+    "req_closed": "❌ Requests are closed. Watch the channel — a new post will come.",
+    "req_prompt": "📝 Write the artist and the title of the track you want next <b>in one message</b>.\n\nFor example: <code>Eminem — Mockingbird</code>\n\nCancel — /cancel",
+    "req_empty": "❌ Empty. Write a track title or /cancel",
+    "req_lost": "❌ Session lost. Try again via the channel post.",
+    "req_closed2": "❌ Requests are already closed.",
+    "req_ok": "✅ Request received, thank you!",
+    "req_full": "❌ The request limit for this session is reached. Wait for the next post.",
+    "req_user_limit": "❌ You've already sent {n} request(s) in this session — that's the maximum.",
+    "req_word_one": "request", "req_word_many": "requests",
+    "rnd_db_empty": "📭 No tracks in the database yet", "rnd_no_match": "📭 No matching tracks", "rnd_none": "❌ No tracks",
+    "search_prompt": "🔍 <b>Search</b>\n\nType a track title or an artist name.\nWorks with Cyrillic and Latin letters.",
+    "nothing_found": "😕 Nothing found for <b>“{q}”</b>.\n\nTry a different spelling, part of the title or just the artist name.",
+    "search_head": "🔍 <b>“{q}”</b> · found {total} · page {page}/{pages}",
+    "tap_listen": "👆 Tap a number to listen",
+    "nav_back": "◀️ Back", "nav_next": "Next ▶️",
+    "page_of": "Page {p} of {n}", "page_short": "Page {p} of {n}",
+    "nf_alert": "❌ Nothing found", "nopage": "❌ Page not found",
+    "fav_empty": "❤️ <b>Favorites is empty</b>\n\nFind a track via 🔍 Search or 🎲 Random and tap “❤️ Add to favorites” — it will appear here.",
+    "fav_head": "❤️ <b>Favorites</b> · {total} tracks · page {page}/{pages}",
+    "fav_foot": "👆 Tap a number to listen • 💔 — remove from favorites",
+    "fav_random": "🎲 Random from favorites",
+    "fav_empty_alert": "❌ Favorites is empty",
+    "fav_added": "❤️ Added to favorites", "fav_removed": "💔 Removed from favorites",
+    "pl_empty": "📋 <b>“{name}”</b> is empty\n\nOpen any track and tap “➕ Add to playlist” to add it here.",
+    "pl_head": "📋 <b>“{name}”</b> · {total} tracks · page {page}/{pages}",
+    "pl_foot": "👆 Tap a number to listen • 🗑 — remove from playlist",
+    "pl_random": "🎲 Random from playlist",
+    "pls_new": "➕ Create playlist ({c}/{m})", "pls_limit": "⛔ Limit: {m} playlists",
+    "pls_head": "📋 <b>Your playlists</b> · {c}/{m}\n\nTap a playlist to open it, or 🗑 to delete it.",
+    "pls_none": "📋 <b>No playlists yet</b>\n\nCreate your first one and add your favorite tracks.",
+    "pl_ask_name": "✏️ What should the playlist be called? Type a name (up to 50 characters)",
+    "pl_bad_name": "❌ The name must be 1–50 characters. Try again",
+    "pl_max": "❌ Maximum {m} playlists. Delete one before creating a new one.",
+    "pl_created": "✅ Playlist <b>“{name}”</b> created!",
+    "pl_deleted": "🗑 Playlist deleted", "pl_first": "Create a playlist first",
+    "pl_which": "📋 <b>Which playlist to add to?</b>",
+    "pl_added": "✅ Added to playlist", "pl_removed": "🗑 Removed from playlist",
+    "pl_empty_alert": "❌ Playlist is empty",
+    "not_found": "❌ Track not found",
+    "btn_unfav": "💔 Remove", "btn_fav": "❤️ Add to favorites", "btn_addpl": "➕ Add to playlist", "btn_similar": "🎵 Similar tracks",
+    "no_similar": "No similar tracks", "similar_head": "🎵 <b>Similar to “{t}”</b>",
+    "top_title": "🔥 <b>Top tracks</b> · {p}",
+    "top_week_btn": "📅 Week", "top_month_btn": "🗓 Month", "top_all_btn": "🏆 All time",
+    "top_week_ttl": "last 7 days", "top_month_ttl": "last 30 days", "top_all_ttl": "all time",
+    "top_total": "📊 Total plays, {p}: <b>{n}</b>",
+    "top_note": "Weekly stats have only just started — showing the all-time top for now.",
+    "top_none": "📭 No plays for this period yet — listen to a few tracks and they'll show up here.",
+    "refresh": "🔄 Refresh", "refreshed": "🔄 Updated", "nochange": "No changes yet — no new plays",
+    "new_none": "📭 No new tracks yet", "new_head": "🆕 <b>New releases</b>",
+    "cancelled": "❌ Cancelled", "nothing_cancel": "Nothing to cancel",
+    "don_start": "💝 <b>Support the bot</b>\n\nThanks for wanting to help! 🙏\nEnter an amount in Telegram Stars ⭐️ ({a} to {b}).\n\nTo cancel: /cancel",
+    "don_nan": "❌ Enter a whole number of stars, e.g. <code>50</code>",
+    "don_range": "❌ The amount must be from {a} to {b} ⭐️",
+    "don_title": "Support the bot", "don_desc": "Donation of {n} ⭐️ for the bot's development", "don_label": "Donation {n} ⭐️",
+    "don_fail": "❌ Couldn't create the invoice. Try again later.",
+    "don_thanks": "💖 <b>Thank you for your support!</b>\n\nYou donated <b>{n} ⭐️</b>. It helps a lot!",
+    "v_closed": "❌ Voting is already closed", "v_same": "You've already voted for this track",
+    "v_already": "You've already voted in this poll", "v_ok": "✅ Your vote for “{name}” is counted!", "v_track": "track",
+    "inl_sub": "🔒 Subscribers only — open the bot", "inl_more": "🎧 More music in the bot",
+    "inl_none": "😕 Nothing found — open the bot",
+},
+}
+
+def tr(uid, key, **kw):
+    """Текст на языке пользователя. uid — id пользователя или код языка ('ru'/'en')."""
+    lang = uid if uid in LANGS else L(uid)
+    val = STR[lang].get(key)
+    if val is None:
+        val = STR["ru"][key]
+    return val.format(**kw) if kw else val
+
+def btn_all(key) -> set:
+    """Подписи кнопки на всех языках — чтобы обработчик ловил любую."""
+    return {STR[l][key] for l in LANGS}
+
 class RegisterUserMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         user = None
@@ -105,6 +397,7 @@ class RegisterUserMiddleware(BaseMiddleware):
             user = event.from_user
         if user and not user.is_bot:
             await register_user(user)
+            await get_lang(user)
         return await handler(event, data)
 
 # --- ГЕЙТ ПОДПИСКИ НА КАНАЛ ---
@@ -182,21 +475,20 @@ async def is_subscribed(user_id: int) -> bool:
         SUB_CACHE[user_id] = (ok, now)
     return ok
 
-def _build_sub_gate_kb(channel_url: str | None) -> InlineKeyboardMarkup:
+def _build_sub_gate_kb(channel_url: str | None, lang: str = "ru") -> InlineKeyboardMarkup:
     rows = []
     if channel_url:
-        rows.append([InlineKeyboardButton(text="📢 Открыть канал", url=channel_url)])
-    rows.append([InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")])
+        rows.append([InlineKeyboardButton(text=tr(lang, "gate_open"), url=channel_url)])
+    rows.append([InlineKeyboardButton(text=tr(lang, "gate_done"), callback_data="check_sub")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 async def send_sub_gate(event):
     url, title = await get_channel_info()
-    title_html = html.escape(title) if title else "наш канал"
-    text = (
-        f"🔒 Доступ к боту только для подписчиков канала <b>{title_html}</b>.\n\n"
-        f"Подпишись и нажми «Я подписался» — и сразу продолжим."
-    )
-    kb = _build_sub_gate_kb(url)
+    ev_user = getattr(event, "from_user", None)
+    lang = await get_lang(ev_user) if ev_user else "ru"
+    title_html = html.escape(title) if title else tr(lang, "gate_title")
+    text = tr(lang, "gate_text", title=title_html)
+    kb = _build_sub_gate_kb(url, lang)
     if isinstance(event, types.CallbackQuery):
         try:
             await event.answer()
@@ -308,9 +600,9 @@ class ThrottleMiddleware(BaseMiddleware):
                 self._last_warn[user.id] = now
                 try:
                     if isinstance(event, types.CallbackQuery):
-                        await event.answer("⏳ Слишком часто! Подожди немного.", show_alert=False)
+                        await event.answer(tr(lang_of(user), "throttle_cb"), show_alert=False)
                     elif isinstance(event, types.Message):
-                        await event.answer("⏳ Слишком часто! Подожди пару секунд.")
+                        await event.answer(tr(lang_of(user), "throttle_msg"))
                 except Exception:
                     pass
             return None
@@ -400,6 +692,7 @@ async def init_db():
                 last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS lang TEXT")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS request_sessions (
                 id SERIAL PRIMARY KEY,
@@ -557,6 +850,10 @@ class RequestForm(StatesGroup):
 class BuyStarsForm(StatesGroup):
     waiting_amount = State()
 
+class VoteDraftForm(StatesGroup):
+    waiting_query = State()
+    waiting_hours = State()
+
 BOT_USERNAME = ""
 
 # --- КОНСТАНТЫ ---
@@ -566,12 +863,17 @@ PL_TRACK_PAGE_SIZE = 5
 MAX_PLAYLISTS = 5
 
 # --- КЛАВИАТУРЫ ---
-menu = ReplyKeyboardMarkup(keyboard=[
-    [KeyboardButton(text="🔍 Поиск"), KeyboardButton(text="🎲 Случайный")],
-    [KeyboardButton(text="🔥 Топ"), KeyboardButton(text="🆕 Новое")],
-    [KeyboardButton(text="❤️ Избранное"), KeyboardButton(text="📋 Список Плейлистов")],
-    [KeyboardButton(text="💝 Донат")],
-], resize_keyboard=True, input_field_placeholder="🔍 Название трека или исполнитель…")
+def get_menu(uid) -> ReplyKeyboardMarkup:
+    """Главное меню на языке пользователя (uid — id или код языка)."""
+    t = lambda k: KeyboardButton(text=tr(uid, k))
+    return ReplyKeyboardMarkup(keyboard=[
+        [t("b_search"), t("b_random")],
+        [t("b_top"), t("b_new")],
+        [t("b_fav"), t("b_pl")],
+        [t("b_donate"), t("b_lang")],
+    ], resize_keyboard=True, input_field_placeholder=tr(uid, "placeholder"))
+
+menu = get_menu("ru")
 
 def clean_artist(a):
     return "" if a and a.startswith("@") else (a or "")
@@ -615,12 +917,12 @@ async def track_keyboard(tid, uid):
         result = await conn.fetchval("SELECT 1 FROM favorites WHERE user_id=$1 AND track_id=$2", uid, tid)
         inf = result is not None
     btn = InlineKeyboardButton(
-        text="💔 Убрать" if inf else "❤️ В избранное",
+        text=tr(uid, "btn_unfav") if inf else tr(uid, "btn_fav"),
         callback_data=f"unfav_{tid}" if inf else f"fav_{tid}"
     )
     return InlineKeyboardMarkup(inline_keyboard=[
-        [btn, InlineKeyboardButton(text="➕ В плейлист", callback_data=f"topl_{tid}")],
-        [InlineKeyboardButton(text="🎵 Похожие треки", callback_data=f"rec_{tid}")]
+        [btn, InlineKeyboardButton(text=tr(uid, "btn_addpl"), callback_data=f"topl_{tid}")],
+        [InlineKeyboardButton(text=tr(uid, "btn_similar"), callback_data=f"rec_{tid}")]
     ])
 
 # --- ПОИСК И ТРАНСЛИТЕРАЦИЯ ---
@@ -944,10 +1246,7 @@ async def show_fav_page(user_id: int, page: int, target, edit: bool = False):
             "SELECT COUNT(*) FROM favorites WHERE user_id=$1", user_id
         )
         if total == 0:
-            text = (
-                "❤️ <b>Избранное пусто</b>\n\n"
-                "Найди трек через 🔍 Поиск или 🎲 Случайный и нажми «❤️ В избранное» — он появится здесь."
-            )
+            text = tr(user_id, "fav_empty")
             if edit:
                 try:
                     await target.message.edit_text(text, parse_mode="HTML")
@@ -968,9 +1267,9 @@ async def show_fav_page(user_id: int, page: int, target, edit: bool = False):
     ids = [r['id'] for r in res]
     lines = [track_line(i, r['artist'], r['title']) for i, r in enumerate(res)]
     h = (
-        f"❤️ <b>Избранное</b> · {total} тр. · стр. {page + 1}/{total_pages}\n\n"
+        tr(user_id, "fav_head", total=total, page=page + 1, pages=total_pages) + "\n\n"
         + "\n\n".join(lines)
-        + "\n\n👆 Нажми на номер, чтобы послушать • 💔 — убрать из избранного"
+        + "\n\n" + tr(user_id, "fav_foot")
     )
     play_rows = num_buttons(ids)
     unfav_btns = [
@@ -980,15 +1279,15 @@ async def show_fav_page(user_id: int, page: int, target, edit: bool = False):
     unfav_rows = [unfav_btns[i:i+5] for i in range(0, len(unfav_btns), 5)]
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"favp_{page - 1}"))
+        nav.append(InlineKeyboardButton(text=tr(user_id, "nav_back"), callback_data=f"favp_{page - 1}"))
     if page < total_pages - 1:
-        nav.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"favp_{page + 1}"))
+        nav.append(InlineKeyboardButton(text=tr(user_id, "nav_next"), callback_data=f"favp_{page + 1}"))
     rows = play_rows + unfav_rows
-    rows.append([InlineKeyboardButton(text="🎲 Случайный из избранного", callback_data="rnd_fav")])
+    rows.append([InlineKeyboardButton(text=tr(user_id, "fav_random"), callback_data="rnd_fav")])
     if nav:
         rows.append(nav)
     if total_pages > 1:
-        rows.append([InlineKeyboardButton(text=f"Стр. {page + 1} из {total_pages}", callback_data="noop")])
+        rows.append([InlineKeyboardButton(text=tr(user_id, "page_short", p=page + 1, n=total_pages), callback_data="noop")])
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
     if edit:
         try:
@@ -1011,10 +1310,7 @@ async def show_playlist_page(pid: int, user_id: int, page: int, target, edit: bo
             "SELECT COUNT(*) FROM playlist_tracks WHERE playlist_id=$1", pid
         )
         if total == 0:
-            text = (
-                f"📋 <b>«{html.escape(pl['name'])}»</b> пока пуст\n\n"
-                "Открой любой трек и нажми «➕ В плейлист», чтобы добавить его сюда."
-            )
+            text = tr(user_id, "pl_empty", name=html.escape(pl['name']))
             if edit:
                 try:
                     await target.message.edit_text(text, parse_mode="HTML")
@@ -1035,9 +1331,9 @@ async def show_playlist_page(pid: int, user_id: int, page: int, target, edit: bo
     ids = [r['id'] for r in res]
     lines = [track_line(i, r['artist'], r['title']) for i, r in enumerate(res)]
     h = (
-        f"📋 <b>«{html.escape(pl['name'])}»</b> · {total} тр. · стр. {page + 1}/{total_pages}\n\n"
+        tr(user_id, "pl_head", name=html.escape(pl['name']), total=total, page=page + 1, pages=total_pages) + "\n\n"
         + "\n\n".join(lines)
-        + "\n\n👆 Нажми на номер, чтобы послушать • 🗑 — убрать из плейлиста"
+        + "\n\n" + tr(user_id, "pl_foot")
     )
     play_rows = num_buttons(ids)
     rm_btns = [
@@ -1047,15 +1343,15 @@ async def show_playlist_page(pid: int, user_id: int, page: int, target, edit: bo
     rm_rows = [rm_btns[i:i+5] for i in range(0, len(rm_btns), 5)]
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"oplp_{pid}_{page - 1}"))
+        nav.append(InlineKeyboardButton(text=tr(user_id, "nav_back"), callback_data=f"oplp_{pid}_{page - 1}"))
     if page < total_pages - 1:
-        nav.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"oplp_{pid}_{page + 1}"))
+        nav.append(InlineKeyboardButton(text=tr(user_id, "nav_next"), callback_data=f"oplp_{pid}_{page + 1}"))
     rows = play_rows + rm_rows
-    rows.append([InlineKeyboardButton(text="🎲 Случайный из плейлиста", callback_data=f"rnd_pl_{pid}")])
+    rows.append([InlineKeyboardButton(text=tr(user_id, "pl_random"), callback_data=f"rnd_pl_{pid}")])
     if nav:
         rows.append(nav)
     if total_pages > 1:
-        rows.append([InlineKeyboardButton(text=f"Стр. {page + 1} из {total_pages}", callback_data="noop")])
+        rows.append([InlineKeyboardButton(text=tr(user_id, "page_short", p=page + 1, n=total_pages), callback_data="noop")])
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
     if edit:
         try:
@@ -1073,69 +1369,29 @@ async def check_sub_cb(cb: types.CallbackQuery):
     SUB_CACHE.pop(cb.from_user.id, None)
     if await is_subscribed(cb.from_user.id):
         try:
-            await cb.answer("✅ Подписка подтверждена!", show_alert=False)
+            await cb.answer(tr(cb.from_user.id, "sub_ok_alert"), show_alert=False)
         except Exception:
             pass
         try:
             if cb.message:
-                await cb.message.edit_text(
-                    "✅ Подписка подтверждена. Жми /start, чтобы начать пользоваться ботом."
-                )
+                await cb.message.edit_text(tr(cb.from_user.id, "sub_ok_msg"))
         except Exception:
             try:
                 if cb.message:
-                    await cb.message.answer(
-                        "✅ Подписка подтверждена. Жми /start, чтобы начать."
-                    )
+                    await cb.message.answer(tr(cb.from_user.id, "sub_ok_msg"))
             except Exception:
                 pass
     else:
         try:
-            await cb.answer(
-                "❌ Подписка не найдена. Подпишись на канал и нажми кнопку ещё раз.",
-                show_alert=True
-            )
+            await cb.answer(tr(cb.from_user.id, "sub_fail"), show_alert=True)
         except Exception:
             pass
 
-START_GREETINGS = [
-    "👋 Привет, <b>{name}</b>!",
-    "🎶 Рад тебя видеть, <b>{name}</b>!",
-    "🎧 Здравствуй, <b>{name}</b>! Самое время для музыки.",
-    "🔥 О, <b>{name}</b>! Давай найдём что-нибудь крутое.",
-    "✨ Привет, <b>{name}</b>! Что послушаем сегодня?",
-    "🎵 <b>{name}</b>, добро пожаловать! Музыка уже ждёт.",
-]
+def random_tip(uid=None) -> str:
+    return tr(uid, "tip_prefix", tip=random.choice(STR[L(uid)]["tips"]))
 
-BOT_TIPS = [
-    "Пиши запрос и по-русски, и латиницей — найдётся и так, и так.",
-    "Под каждым треком есть «🎵 Похожие треки» — подборка по исполнителю.",
-    "Нажми «➕ В плейлист» под любым треком, чтобы сохранить его в свою подборку.",
-    "В избранном есть кнопка «🎲 Случайный из избранного» — для настроения.",
-    "В топе можно переключать период: неделя, месяц или всё время.",
-    "Хватит и части названия — искать можно по обрывку слова.",
-    "В 🆕 Новом лежат самые свежие добавления — загляни, чтобы не пропустить новинки.",
-]
-
-def random_tip() -> str:
-    return "💡 <i>Совет: " + random.choice(BOT_TIPS) + "</i>"
-
-HELP_TEXT = (
-    "🎧 <b>Музыкальный бот</b>\n"
-    "Слушай треки из канала прямо в чате.\n\n"
-    "━━━━━━━━━━━━━━\n"
-    "🎵 <b>Музыка</b>\n"
-    "🔍 <b>Поиск</b> — название или исполнитель, по-русски или латиницей\n"
-    "🎲 <b>Случайный</b> — удиви меня\n"
-    "🔥 <b>Топ</b> — что слушают: неделя, месяц, всё время\n"
-    "🆕 <b>Новое</b> — свежие добавления\n\n"
-    "👤 <b>Твоё</b>\n"
-    "❤️ <b>Избранное</b> — любимые треки\n"
-    "📋 <b>Плейлисты</b> — до {max_pl} своих подборок\n"
-    "💝 <b>Донат</b> — поддержать бота звёздами\n"
-    "━━━━━━━━━━━━━━\n\n"
-    "Просто напиши запрос в чат — и я найду трек 👇"
-)
+def help_text(uid=None) -> str:
+    return tr(uid, "help", max_pl=MAX_PLAYLISTS)
 
 @dp.message(Command("start"))
 async def start_cmd(m: types.Message, state: FSMContext):
@@ -1153,25 +1409,18 @@ async def start_cmd(m: types.Message, state: FSMContext):
                     "SELECT id, status FROM request_sessions WHERE id=$1", sid
                 )
             if not session or session['status'] != 'active':
-                await m.answer(
-                    "❌ Сбор заявок уже закрыт. Следи за каналом — будет новый пост.",
-                    reply_markup=menu
-                )
+                await m.answer(tr(m.from_user.id, "req_closed"), reply_markup=get_menu(m.from_user.id))
                 return
             await state.set_state(RequestForm.waiting_text)
             await state.update_data(session_id=sid)
-            await m.answer(
-                "📝 Напиши <b>одним сообщением</b> исполнителя и название трека, "
-                "который хочешь следующим.\n\nНапример: <code>Eminem — Mockingbird</code>\n\n"
-                "Отменить — /cancel",
-                parse_mode="HTML"
-            )
+            await m.answer(tr(m.from_user.id, "req_prompt"), parse_mode="HTML")
             return
-    name = html.escape(m.from_user.first_name or "друг")
-    greeting = random.choice(START_GREETINGS).format(name=name)
+    uid = m.from_user.id
+    name = html.escape(m.from_user.first_name or tr(uid, "friend"))
+    greeting = random.choice(STR[L(uid)]["greetings"]).format(name=name)
     await m.answer(
-        f"{greeting}\n\n" + HELP_TEXT.format(max_pl=MAX_PLAYLISTS) + "\n\n" + random_tip(),
-        reply_markup=menu,
+        f"{greeting}\n\n" + help_text(uid) + "\n\n" + random_tip(uid),
+        reply_markup=get_menu(uid),
         parse_mode="HTML"
     )
 
@@ -1179,7 +1428,7 @@ async def start_cmd(m: types.Message, state: FSMContext):
 async def request_text_handler(m: types.Message, state: FSMContext):
     text = (m.text or "").strip()
     if not text:
-        await m.answer("❌ Пусто. Напиши название трека или /cancel")
+        await m.answer(tr(m.from_user.id, "req_empty"))
         return
     if len(text) > 500:
         text = text[:500]
@@ -1187,7 +1436,7 @@ async def request_text_handler(m: types.Message, state: FSMContext):
     sid = data.get("session_id")
     if not sid:
         await state.clear()
-        await m.answer("❌ Сессия потеряна. Попробуй снова через пост в канале.")
+        await m.answer(tr(m.from_user.id, "req_lost"))
         return
     async with db_pool.acquire() as conn:
         session = await conn.fetchrow(
@@ -1195,12 +1444,12 @@ async def request_text_handler(m: types.Message, state: FSMContext):
         )
         if not session or session['status'] != 'active':
             await state.clear()
-            await m.answer("❌ Сбор заявок уже закрыт.")
+            await m.answer(tr(m.from_user.id, "req_closed2"))
             return
         err_code, err_text = await _request_limit_status(conn, sid, m.from_user.id)
         if err_code:
             await state.clear()
-            await m.answer(err_text, reply_markup=menu)
+            await m.answer(err_text, reply_markup=get_menu(m.from_user.id))
             return
         await conn.execute(
             "INSERT INTO track_requests "
@@ -1213,7 +1462,7 @@ async def request_text_handler(m: types.Message, state: FSMContext):
             text
         )
     await state.clear()
-    await m.answer("✅ Заявка принята, спасибо!", reply_markup=menu)
+    await m.answer(tr(m.from_user.id, "req_ok"), reply_markup=get_menu(m.from_user.id))
 
 @dp.channel_post(F.audio)
 async def save_track(m: types.Message):
@@ -1261,7 +1510,7 @@ async def _send_random_track(target, user_id: int, query: str = ""):
                 f"SELECT MIN(id) AS mn, MAX(id) AS mx FROM tracks{' WHERE ' + query if query else ''}"
             )
             if not bounds or bounds['mx'] is None:
-                text = "📭 В базе пока нет треков" if not query else "📭 Подходящих треков нет"
+                text = tr(user_id, "rnd_db_empty" if not query else "rnd_no_match")
                 if isinstance(target, types.Message):
                     await target.answer(text)
                 else:
@@ -1275,9 +1524,9 @@ async def _send_random_track(target, user_id: int, query: str = ""):
                 r = await conn.fetchrow(sql_fallback)
             if not r:
                 if isinstance(target, types.Message):
-                    await target.answer("❌ Нет треков")
+                    await target.answer(tr(user_id, "rnd_none"))
                 else:
-                    await target.answer("❌ Нет треков", show_alert=True)
+                    await target.answer(tr(user_id, "rnd_none"), show_alert=True)
                 return
             await log_play(conn, r['id'], user_id)
         kb = await track_keyboard(r['id'], user_id)
@@ -1289,21 +1538,16 @@ async def _send_random_track(target, user_id: int, query: str = ""):
     except Exception as e:
         logging.error(f"Ошибка в _send_random_track: {e}")
 
-@dp.message(F.text == "🎲 Случайный")
+@dp.message(F.text.in_(btn_all("b_random")))
 async def rnd(m: types.Message):
     await _send_random_track(m, m.from_user.id)
 
-@dp.message(F.text == "🔍 Поиск")
+@dp.message(F.text.in_(btn_all("b_search")))
 async def sb(m: types.Message, state: FSMContext):
     await state.clear()
-    await m.answer(
-        "🔍 <b>Поиск</b>\n\n"
-        "Напиши название трека или имя исполнителя.\n"
-        "Работает и по-русски, и латиницей.",
-        parse_mode="HTML"
-    )
+    await m.answer(tr(m.from_user.id, "search_prompt"), parse_mode="HTML")
 
-@dp.message(F.text == "❤️ Избранное")
+@dp.message(F.text.in_(btn_all("b_fav")))
 async def sf(m: types.Message):
     try:
         await show_fav_page(m.from_user.id, 0, m)
@@ -1318,20 +1562,20 @@ async def fav_page_cb(c: types.CallbackQuery):
         await c.answer()
     except Exception as e:
         logging.error(f"Ошибка в fav_page_cb: {e}")
-        await c.answer("❌ Ошибка", show_alert=True)
+        await c.answer(tr(c.from_user.id, "err"), show_alert=True)
 
 # Периоды топа: ключ -> (подпись кнопки, подпись в заголовке, SQL-интервал или None).
 # Интервалы задаются только здесь (не приходят от пользователя), поэтому подставляются в SQL безопасно.
 TOP_PERIODS = {
-    "week":  ("📅 Неделя", "за 7 дней", "7 days"),
-    "month": ("🗓 Месяц", "за 30 дней", "30 days"),
-    "all":   ("🏆 Всё время", "за всё время", None),
+    "week":  ("week", "7 days"),
+    "month": ("month", "30 days"),
+    "all":   ("all", None),
 }
 
 async def _top_rows(period: str):
     pool = await get_db()
     async with pool.acquire() as conn:
-        interval = TOP_PERIODS[period][2]
+        interval = TOP_PERIODS[period][1]
         if interval is None:
             return await conn.fetch(
                 "SELECT id, artist, title, plays AS cnt FROM tracks "
@@ -1349,7 +1593,7 @@ async def _top_total(period: str) -> int:
     """Сколько всего прослушиваний за период — меняется после каждого прослушивания."""
     pool = await get_db()
     async with pool.acquire() as conn:
-        interval = TOP_PERIODS[period][2]
+        interval = TOP_PERIODS[period][1]
         if interval is None:
             return int(await conn.fetchval("SELECT COALESCE(SUM(plays),0) FROM tracks") or 0)
         return int(await conn.fetchval(
@@ -1357,16 +1601,16 @@ async def _top_total(period: str) -> int:
             f"WHERE played_at >= CURRENT_TIMESTAMP - INTERVAL '{interval}'"
         ) or 0)
 
-def _top_period_row(active: str):
+def _top_period_row(active: str, uid=None):
     return [
         InlineKeyboardButton(
-            text=("✅ " if key == active else "") + label,
+            text=("✅ " if key == active else "") + tr(uid, f"top_{key}_btn"),
             callback_data=f"top_{key}"
         )
-        for key, (label, _, _) in TOP_PERIODS.items()
+        for key in TOP_PERIODS
     ]
 
-async def build_top(period: str, fallback_to_all: bool = False):
+async def build_top(period: str, fallback_to_all: bool = False, uid=None):
     """Возвращает (текст, клавиатура) топа за период.
     fallback_to_all: если за период ещё нет прослушиваний, показать топ за всё время."""
     res = await _top_rows(period)
@@ -1375,13 +1619,14 @@ async def build_top(period: str, fallback_to_all: bool = False):
         res = await _top_rows("all")
         if res:
             period = "all"
-            note = "\n<i>Статистика по неделям только начала копиться — пока показан топ за всё время.</i>"
-    title = f"🔥 <b>Топ треков</b> · {TOP_PERIODS[period][1]}"
-    period_row = _top_period_row(period)
-    refresh_row = [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"top_{period}")]
+            note = "\n<i>" + tr(uid, "top_note") + "</i>"
+    p_ttl = tr(uid, f"top_{period}_ttl")
+    title = tr(uid, "top_title", p=p_ttl)
+    period_row = _top_period_row(period, uid)
+    refresh_row = [InlineKeyboardButton(text=tr(uid, "refresh"), callback_data=f"top_{period}")]
     if not res:
         return (
-            f"{title}\n\n📭 За этот период прослушиваний пока нет — послушай пару треков, и они появятся здесь.",
+            f"{title}\n\n" + tr(uid, "top_none"),
             InlineKeyboardMarkup(inline_keyboard=[period_row, refresh_row])
         )
     medals = ["🥇", "🥈", "🥉"]
@@ -1395,17 +1640,17 @@ async def build_top(period: str, fallback_to_all: bool = False):
     total = await _top_total(period)
     text = (
         title + "\n\n" + "\n\n".join(lines)
-        + f"\n\n📊 Всего прослушиваний {TOP_PERIODS[period][1]}: <b>{total}</b>"
-        + "\n👆 Нажми на номер, чтобы послушать"
+        + "\n\n" + tr(uid, "top_total", p=p_ttl, n=total)
+        + "\n" + tr(uid, "tap_listen")
         + note
     )
     kb = InlineKeyboardMarkup(inline_keyboard=num_buttons(ids) + [period_row, refresh_row])
     return text, kb
 
-@dp.message(F.text == "🔥 Топ")
+@dp.message(F.text.in_(btn_all("b_top")))
 async def top(m: types.Message):
     try:
-        text, kb = await build_top("week", fallback_to_all=True)
+        text, kb = await build_top("week", fallback_to_all=True, uid=m.from_user.id)
         await m.answer(text, reply_markup=kb, parse_mode="HTML")
     except Exception as e:
         logging.error(f"Ошибка в top: {e}")
@@ -1417,21 +1662,21 @@ async def top_period_cb(c: types.CallbackQuery):
         await c.answer()
         return
     try:
-        text, kb = await build_top(period)
+        text, kb = await build_top(period, uid=c.from_user.id)
         try:
             await c.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-            await c.answer("🔄 Обновлено")
+            await c.answer(tr(c.from_user.id, "refreshed"))
         except Exception as e:
             if "not modified" in str(e).lower():
-                await c.answer("Пока без изменений — новых прослушиваний нет")
+                await c.answer(tr(c.from_user.id, "nochange"))
             else:
                 logging.warning(f"Не удалось обновить сообщение топа: {e}")
                 await c.answer()
     except Exception as e:
         logging.error(f"Ошибка в top_period_cb: {e}")
-        await c.answer("❌ Ошибка", show_alert=True)
+        await c.answer(tr(c.from_user.id, "err"), show_alert=True)
 
-@dp.message(F.text == "🆕 Новое")
+@dp.message(F.text.in_(btn_all("b_new")))
 async def new_tracks(m: types.Message):
     try:
         async with db_pool.acquire() as conn:
@@ -1439,7 +1684,7 @@ async def new_tracks(m: types.Message):
                 "SELECT id, title, artist, created_at FROM tracks ORDER BY created_at DESC LIMIT 10"
             )
         if not res:
-            await m.answer("📭 Новых треков пока нет")
+            await m.answer(tr(m.from_user.id, "new_none"))
             return
         lines = [
             track_line(i, r['artist'], r['title'], extra=f"<i>{r['created_at'].strftime('%d.%m.%Y')}</i>")
@@ -1449,7 +1694,7 @@ async def new_tracks(m: types.Message):
         kb_rows = num_buttons(ids)
         kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
         await m.answer(
-            "🆕 <b>Новинки</b>\n\n" + "\n\n".join(lines) + "\n\n👆 Нажми на номер, чтобы послушать",
+            tr(m.from_user.id, "new_head") + "\n\n" + "\n\n".join(lines) + "\n\n" + tr(m.from_user.id, "tap_listen"),
             reply_markup=kb,
             parse_mode="HTML"
         )
@@ -1464,7 +1709,7 @@ async def rnd_fav_cb(c: types.CallbackQuery):
                 "SELECT track_id FROM favorites WHERE user_id=$1", c.from_user.id
             )
         if not track_ids:
-            await c.answer("❌ Избранное пусто", show_alert=True)
+            await c.answer(tr(c.from_user.id, "fav_empty_alert"), show_alert=True)
             return
         ids = [r['track_id'] for r in track_ids]
         chosen = random.choice(ids)
@@ -1477,7 +1722,7 @@ async def rnd_fav_cb(c: types.CallbackQuery):
         await c.answer()
     except Exception as e:
         logging.error(f"Ошибка в rnd_fav_cb: {e}")
-        await c.answer("❌ Ошибка", show_alert=True)
+        await c.answer(tr(c.from_user.id, "err"), show_alert=True)
 
 @dp.callback_query(F.data.startswith("rnd_pl_"))
 async def rnd_pl_cb(c: types.CallbackQuery):
@@ -1494,7 +1739,7 @@ async def rnd_pl_cb(c: types.CallbackQuery):
                 "SELECT track_id FROM playlist_tracks WHERE playlist_id=$1", pid
             )
         if not track_ids:
-            await c.answer("❌ Плейлист пуст", show_alert=True)
+            await c.answer(tr(c.from_user.id, "pl_empty_alert"), show_alert=True)
             return
         ids = [r['track_id'] for r in track_ids]
         chosen = random.choice(ids)
@@ -1507,9 +1752,9 @@ async def rnd_pl_cb(c: types.CallbackQuery):
         await c.answer()
     except Exception as e:
         logging.error(f"Ошибка в rnd_pl_cb: {e}")
-        await c.answer("❌ Ошибка", show_alert=True)
+        await c.answer(tr(c.from_user.id, "err"), show_alert=True)
 
-@dp.message(F.text == "📋 Список Плейлистов")
+@dp.message(F.text.in_(btn_all("b_pl")))
 async def spl(m: types.Message, state: FSMContext):
     await state.clear()
     pool = await get_db()
@@ -1526,22 +1771,16 @@ async def spl(m: types.Message, state: FSMContext):
         ]
         if count < MAX_PLAYLISTS:
             rows.append([InlineKeyboardButton(
-                text=f"➕ Создать плейлист ({count}/{MAX_PLAYLISTS})", callback_data="plnew"
+                text=tr(m.from_user.id, "pls_new", c=count, m=MAX_PLAYLISTS), callback_data="plnew"
             )])
         else:
             rows.append([InlineKeyboardButton(
-                text=f"⛔ Лимит: {MAX_PLAYLISTS} плейлистов", callback_data="noop"
+                text=tr(m.from_user.id, "pls_limit", m=MAX_PLAYLISTS), callback_data="noop"
             )])
         if count:
-            text = (
-                f"📋 <b>Твои плейлисты</b> · {count}/{MAX_PLAYLISTS}\n\n"
-                "Нажми на плейлист, чтобы открыть, или 🗑, чтобы удалить."
-            )
+            text = tr(m.from_user.id, "pls_head", c=count, m=MAX_PLAYLISTS)
         else:
-            text = (
-                "📋 <b>Плейлистов пока нет</b>\n\n"
-                "Создай первый — и добавляй в него любимые треки."
-            )
+            text = tr(m.from_user.id, "pls_none")
         await m.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
     except Exception as e:
         logging.error(f"Ошибка в spl: {e}")
@@ -1549,14 +1788,14 @@ async def spl(m: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "plnew")
 async def cpn(c: types.CallbackQuery, state: FSMContext):
     await state.set_state(PlaylistForm.waiting_name)
-    await c.message.answer("✏️ Как назвать плейлист? Напиши название (до 50 символов)")
+    await c.message.answer(tr(c.from_user.id, "pl_ask_name"))
     await c.answer()
 
 @dp.message(PlaylistForm.waiting_name)
 async def rpn(m: types.Message, state: FSMContext):
     n = m.text.strip()
     if not n or len(n) > 50:
-        await m.answer("❌ Название должно быть от 1 до 50 символов. Попробуй ещё раз")
+        await m.answer(tr(m.from_user.id, "pl_bad_name"))
         return
     pool = await get_db()
     try:
@@ -1566,11 +1805,11 @@ async def rpn(m: types.Message, state: FSMContext):
             )
             if count >= MAX_PLAYLISTS:
                 await state.clear()
-                await m.answer(f"❌ Максимум {MAX_PLAYLISTS} плейлистов. Удали один перед созданием нового.")
+                await m.answer(tr(m.from_user.id, "pl_max", m=MAX_PLAYLISTS))
                 return
             await conn.execute("INSERT INTO playlists (user_id, name) VALUES ($1, $2)", m.from_user.id, n)
         await state.clear()
-        await m.answer(f"✅ Плейлист <b>«{html.escape(n)}»</b> создан!", parse_mode="HTML")
+        await m.answer(tr(m.from_user.id, "pl_created", name=html.escape(n)), parse_mode="HTML")
     except Exception as e:
         logging.error(f"Ошибка в rpn: {e}")
 
@@ -1584,7 +1823,7 @@ async def dpl(c: types.CallbackQuery):
                 await c.answer("❌", show_alert=True)
                 return
             await conn.execute("DELETE FROM playlists WHERE id=$1", pid)
-        await c.answer("🗑 Плейлист удалён")
+        await c.answer(tr(c.from_user.id, "pl_deleted"))
         try: await c.message.delete()
         except: pass
     except Exception as e:
@@ -1608,7 +1847,7 @@ async def oplp(c: types.CallbackQuery):
         await c.answer()
     except Exception as e:
         logging.error(f"Ошибка в oplp: {e}")
-        await c.answer("❌ Ошибка", show_alert=True)
+        await c.answer(tr(c.from_user.id, "err"), show_alert=True)
 
 @dp.callback_query(F.data.startswith("topl_"))
 async def cpl(c: types.CallbackQuery):
@@ -1618,13 +1857,13 @@ async def cpl(c: types.CallbackQuery):
         async with pool.acquire() as conn:
             pls = await conn.fetch("SELECT id, name FROM playlists WHERE user_id=$1", c.from_user.id)
         if not pls:
-            await c.answer("Сначала создай плейлист", show_alert=True)
+            await c.answer(tr(c.from_user.id, "pl_first"), show_alert=True)
             return
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=f"📋 {p['name']}", callback_data=f"apl_{p['id']}_{tid}")]
             for p in pls
         ])
-        await c.message.answer("📋 <b>В какой плейлист добавить?</b>", reply_markup=kb, parse_mode="HTML")
+        await c.message.answer(tr(c.from_user.id, "pl_which"), reply_markup=kb, parse_mode="HTML")
         await c.answer()
     except Exception as e:
         logging.error(f"Ошибка в cpl: {e}")
@@ -1640,7 +1879,7 @@ async def apl(c: types.CallbackQuery):
                 "INSERT INTO playlist_tracks (playlist_id, track_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
                 pid, tid
             )
-        await c.answer("✅ Добавлено в плейлист")
+        await c.answer(tr(c.from_user.id, "pl_added"))
         try: await c.message.delete()
         except: pass
     except Exception as e:
@@ -1658,7 +1897,7 @@ async def rmpl(c: types.CallbackQuery):
                 "DELETE FROM playlist_tracks WHERE playlist_id=$1 AND track_id=$2",
                 pid, tid
             )
-        await c.answer("🗑 Убрано из плейлиста")
+        await c.answer(tr(c.from_user.id, "pl_removed"))
         await show_playlist_page(pid, c.from_user.id, page, c, edit=True)
     except Exception as e:
         logging.error(f"Ошибка в rmpl: {e}")
@@ -1671,7 +1910,7 @@ async def st(c: types.CallbackQuery):
         async with pool.acquire() as conn:
             r = await conn.fetchrow("SELECT id, file_id FROM tracks WHERE id=$1", tid)
             if not r:
-                await c.answer("❌ Трек не найден", show_alert=True)
+                await c.answer(tr(c.from_user.id, "not_found"), show_alert=True)
                 return
             await log_play(conn, tid, c.from_user.id)
         await c.message.answer_audio(r['file_id'], reply_markup=await track_keyboard(tid, c.from_user.id))
@@ -1708,7 +1947,7 @@ async def fav(c: types.CallbackQuery):
                 "INSERT INTO favorites (user_id, track_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
                 c.from_user.id, tid
             )
-        await c.answer("❤️ Добавлено в избранное")
+        await c.answer(tr(c.from_user.id, "fav_added"))
         try:
             await c.message.edit_reply_markup(reply_markup=await track_keyboard(tid, c.from_user.id))
         except: pass
@@ -1728,7 +1967,7 @@ async def unfav(c: types.CallbackQuery):
                     "DELETE FROM favorites WHERE user_id=$1 AND track_id=$2",
                     c.from_user.id, tid
                 )
-            await c.answer("💔 Убрано из избранного")
+            await c.answer(tr(c.from_user.id, "fav_removed"))
             await show_fav_page(c.from_user.id, page, c, edit=True)
         else:
             tid = int(parts[1])
@@ -1738,7 +1977,7 @@ async def unfav(c: types.CallbackQuery):
                     "DELETE FROM favorites WHERE user_id=$1 AND track_id=$2",
                     c.from_user.id, tid
                 )
-            await c.answer("💔 Убрано из избранного")
+            await c.answer(tr(c.from_user.id, "fav_removed"))
             try:
                 await c.message.edit_reply_markup(reply_markup=await track_keyboard(tid, c.from_user.id))
             except: pass
@@ -1755,7 +1994,7 @@ async def rec_cmd(c: types.CallbackQuery):
         async with pool.acquire() as conn:
             track = await conn.fetchrow("SELECT id, title, artist FROM tracks WHERE id=$1", tid)
             if not track:
-                await c.answer("❌ Трек не найден", show_alert=True)
+                await c.answer(tr(c.from_user.id, "not_found"), show_alert=True)
                 return
             recs = []
             artist = track['artist']
@@ -1777,66 +2016,60 @@ async def rec_cmd(c: types.CallbackQuery):
                 ))
                 recs += top
         if not recs:
-            await c.answer("Похожих треков нет", show_alert=True)
+            await c.answer(tr(c.from_user.id, "no_similar"), show_alert=True)
             return
         ids = [r['id'] for r in recs]
         lines = [track_line(i, r['artist'], r['title']) for i, r in enumerate(recs)]
         title_str = html.escape(format_track(track['artist'], track['title']))
-        h = f"🎵 <b>Похожие на «{title_str}»</b>\n\n" + "\n\n".join(lines)
+        h = tr(c.from_user.id, "similar_head", t=title_str) + "\n\n" + "\n\n".join(lines)
         kb = InlineKeyboardMarkup(inline_keyboard=num_buttons(ids))
         await c.message.answer(h, reply_markup=kb, parse_mode="HTML")
         await c.answer()
     except Exception as e:
         logging.error(f"Ошибка в rec_cmd: {e}")
-        await c.answer("❌ Ошибка", show_alert=True)
+        await c.answer(tr(c.from_user.id, "err"), show_alert=True)
 
 @dp.message(Command("cancel"))
 async def cancel_cmd(m: types.Message, state: FSMContext):
     cur = await state.get_state()
     if cur:
         await state.clear()
-        await m.answer("❌ Отменено", reply_markup=menu)
+        await m.answer(tr(m.from_user.id, "cancelled"), reply_markup=get_menu(m.from_user.id))
     else:
-        await m.answer("Нечего отменять", reply_markup=menu)
+        await m.answer(tr(m.from_user.id, "nothing_cancel"), reply_markup=get_menu(m.from_user.id))
 
 # --- ДОНАТ (Telegram Stars) ---
 DONATE_MIN = 1
 DONATE_MAX = 100000
 
-@dp.message(F.text == "💝 Донат")
+@dp.message(F.text.in_(btn_all("b_donate")))
 async def donate_start(m: types.Message, state: FSMContext):
     await state.set_state(DonateForm.waiting_amount)
-    await m.answer(
-        "💝 <b>Поддержать бота</b>\n\n"
-        "Спасибо, что хочешь помочь! 🙏\n"
-        f"Введи сумму в Telegram Stars ⭐️ (от {DONATE_MIN} до {DONATE_MAX}).\n\n"
-        "Для отмены: /cancel",
-        parse_mode="HTML",
-    )
+    await m.answer(tr(m.from_user.id, "don_start", a=DONATE_MIN, b=DONATE_MAX), parse_mode="HTML")
 
 @dp.message(DonateForm.waiting_amount)
 async def donate_amount(m: types.Message, state: FSMContext):
     txt = (m.text or "").strip()
     if not txt.isdigit():
-        await m.answer("❌ Введи целое число звёзд, например: <code>50</code>", parse_mode="HTML")
+        await m.answer(tr(m.from_user.id, "don_nan"), parse_mode="HTML")
         return
     amount = int(txt)
     if amount < DONATE_MIN or amount > DONATE_MAX:
-        await m.answer(f"❌ Сумма должна быть от {DONATE_MIN} до {DONATE_MAX} ⭐️")
+        await m.answer(tr(m.from_user.id, "don_range", a=DONATE_MIN, b=DONATE_MAX))
         return
     await state.clear()
     try:
         await bot.send_invoice(
             chat_id=m.chat.id,
-            title="Поддержка бота",
-            description=f"Донат {amount} ⭐️ на развитие бота",
+            title=tr(m.from_user.id, "don_title"),
+            description=tr(m.from_user.id, "don_desc", n=amount),
             payload=f"donate:{m.from_user.id}:{amount}",
             currency="XTR",
-            prices=[LabeledPrice(label=f"Донат {amount} ⭐️", amount=amount)],
+            prices=[LabeledPrice(label=tr(m.from_user.id, "don_label", n=amount), amount=amount)],
         )
     except Exception as e:
         logging.error(f"Ошибка отправки счёта: {e}")
-        await m.answer("❌ Не удалось создать счёт. Попробуй позже.")
+        await m.answer(tr(m.from_user.id, "don_fail"))
 
 @dp.pre_checkout_query()
 async def pre_checkout(q: PreCheckoutQuery):
@@ -1850,9 +2083,9 @@ async def on_payment(m: types.Message):
     sp = m.successful_payment
     amount = sp.total_amount
     await m.answer(
-        f"💖 <b>Спасибо за поддержку!</b>\n\nТы задонатил <b>{amount} ⭐️</b>. Это очень помогает!",
+        tr(m.from_user.id, "don_thanks", n=amount),
         parse_mode="HTML",
-        reply_markup=menu
+        reply_markup=get_menu(m.from_user.id)
     )
     if ADMIN_ID and m.from_user.id != ADMIN_ID:
         try:
@@ -2032,19 +2265,19 @@ async def broadcast_send(m: types.Message, state: FSMContext):
         logging.error(f"Ошибка в broadcast_send: {e}")
         await m.answer(f"❌ Ошибка рассылки: {e}")
 
-def build_search_keyboard(query: str, offset: int, total: int) -> InlineKeyboardMarkup:
+def build_search_keyboard(query: str, offset: int, total: int, uid=None) -> InlineKeyboardMarkup:
     total_pages = math.ceil(total / PAGE_SIZE)
     current_page = offset // PAGE_SIZE + 1
     nav = []
     q = query[:50]
     if offset > 0:
-        nav.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"pg_{offset - PAGE_SIZE}:{q}"))
+        nav.append(InlineKeyboardButton(text=tr(uid, "nav_back"), callback_data=f"pg_{offset - PAGE_SIZE}:{q}"))
     if offset + PAGE_SIZE < total:
-        nav.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"pg_{offset + PAGE_SIZE}:{q}"))
+        nav.append(InlineKeyboardButton(text=tr(uid, "nav_next"), callback_data=f"pg_{offset + PAGE_SIZE}:{q}"))
     rows = []
     if nav:
         rows.append(nav)
-    rows.append([InlineKeyboardButton(text=f"Страница {current_page} из {total_pages}", callback_data="noop")])
+    rows.append([InlineKeyboardButton(text=tr(uid, "page_of", p=current_page, n=total_pages), callback_data="noop")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 async def log_missed_search(query: str, user_id):
@@ -2062,20 +2295,252 @@ async def log_missed_search(query: str, user_id):
     except Exception as e:
         logging.warning(f"Не удалось записать пустой запрос: {e}")
 
-def build_search_text(query: str, total: int, offset: int, res) -> str:
+def build_search_text(query: str, total: int, offset: int, res, uid=None) -> str:
     total_pages = math.ceil(total / PAGE_SIZE)
     current_page = offset // PAGE_SIZE + 1
     lines = [track_line(i, r['artist'], r['title']) for i, r in enumerate(res)]
     return (
-        f"🔍 <b>«{html.escape(query[:50])}»</b> · найдено {total} · стр. {current_page}/{total_pages}\n\n"
+        tr(uid, "search_head", q=html.escape(query[:50]), total=total, page=current_page, pages=total_pages) + "\n\n"
         + "\n\n".join(lines)
-        + "\n\n👆 Нажми на номер, чтобы послушать"
+        + "\n\n" + tr(uid, "tap_listen")
     )
 
-@dp.message(F.chat.type == "private", F.text & ~F.text.startswith("/") & ~F.text.in_({"🔍 Поиск","🎲 Случайный","🔥 Топ","🆕 Новое","❤️ Избранное","📋 Список Плейлистов","💝 Донат","⭐️ Купить Stars"}))
+# --- ПРЕДПРОСМОТР ГОЛОСОВАНИЯ ---
+VOTE_DRAFTS: dict[str, dict] = {}
+VOTE_MAX_CANDIDATES = 10
+
+def _vd_text(d) -> str:
+    label = html.escape(_vote_short_label(d['vote_type'], d['period']))
+    timer = f"закроется через {d['hours']} ч" if d['hours'] else "без таймера (закроешь вручную)"
+    lines = []
+    for i, t in enumerate(d['tracks'], 1):
+        lines.append(f"{i}. {html.escape(format_track(t['artist'], t['title']))} · {t.get('plays') or 0} 🎧")
+    warn = "\n\n⚠️ Нужно минимум 2 трека." if len(d['tracks']) < 2 else ""
+    return (
+        f"🔎 <b>Предпросмотр голосования</b>\n«{label}» · {timer}\n\n"
+        + "\n".join(lines) + warn
+        + "\n\n❌ N — убрать трек · ➕ — добавить свой · ⏱ — таймер\n"
+        "<i>В канал пока ничего не отправлено.</i>"
+    )
+
+def _vd_kb(d) -> InlineKeyboardMarkup:
+    did = d['id']
+    rm = [InlineKeyboardButton(text=f"❌ {i + 1}", callback_data=f"vd_rm_{did}_{t['id']}")
+          for i, t in enumerate(d['tracks'])]
+    rows = [rm[i:i + 5] for i in range(0, len(rm), 5)]
+    timer = f"{d['hours']} ч" if d['hours'] else "нет"
+    rows.append([
+        InlineKeyboardButton(text="➕ Добавить трек", callback_data=f"vd_add_{did}"),
+        InlineKeyboardButton(text=f"⏱ Таймер: {timer}", callback_data=f"vd_time_{did}"),
+    ])
+    rows.append([
+        InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"vd_pub_{did}"),
+        InlineKeyboardButton(text="✖️ Отмена", callback_data=f"vd_cancel_{did}"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+async def _vd_refresh(d):
+    try:
+        await bot.edit_message_text(
+            _vd_text(d), chat_id=d['chat_id'], message_id=d['msg_id'],
+            parse_mode="HTML", reply_markup=_vd_kb(d)
+        )
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            logging.warning(f"Не удалось обновить предпросмотр голосования: {e}")
+
+async def _vd_create_and_show(m: types.Message, vote_type: str, period: str, artist, hours, tracks):
+    did = os.urandom(4).hex()
+    d = {
+        'id': did, 'vote_type': vote_type, 'period': period, 'artist': artist, 'hours': hours,
+        'tracks': [dict(t) for t in tracks],
+    }
+    while len(VOTE_DRAFTS) >= 10:
+        VOTE_DRAFTS.pop(next(iter(VOTE_DRAFTS)))
+    VOTE_DRAFTS[did] = d
+    sent = await m.answer(_vd_text(d), parse_mode="HTML", reply_markup=_vd_kb(d))
+    d['chat_id'] = sent.chat.id
+    d['msg_id'] = sent.message_id
+
+async def _vd_publish(d):
+    """Публикует черновик в канал. Возвращает (успех, сообщение_админу)."""
+    channel_id = get_channel_id()
+    if not channel_id:
+        return False, "❌ CHANNEL_ID не задан"
+    tracks = d['tracks']
+    if len(tracks) < 2:
+        return False, "❌ Нужно минимум 2 трека"
+    vote_type, period, hours = d['vote_type'], d['period'], d['hours']
+    async with db_pool.acquire() as conn:
+        existing = await conn.fetchval(
+            "SELECT id FROM vote_sessions WHERE vote_type=$1 AND period=$2 AND status='active'",
+            vote_type, period
+        )
+        if existing:
+            return False, "⚠️ Такое голосование уже идёт"
+        await conn.execute(
+            "DELETE FROM vote_sessions WHERE vote_type=$1 AND period=$2 AND status<>'active'",
+            vote_type, period
+        )
+        closes_at = datetime.datetime.utcnow() + datetime.timedelta(hours=hours) if hours else None
+        session_id = await conn.fetchval(
+            "INSERT INTO vote_sessions (vote_type, period, closes_at) VALUES ($1, $2, $3) RETURNING id",
+            vote_type, period, closes_at
+        )
+        await conn.executemany(
+            "INSERT INTO vote_candidates (session_id, track_id) VALUES ($1, $2)",
+            [(session_id, t['id']) for t in tracks]
+        )
+    rows = await get_vote_counts(session_id)
+    created = None if vote_type == 'artist' else datetime.datetime.utcnow()
+    text = build_vote_text(vote_type, period, rows, closes_at=closes_at, created_at=created)
+    kb = build_vote_keyboard(session_id, rows)
+    try:
+        msg = await bot.send_message(channel_id, text, parse_mode="HTML", reply_markup=kb)
+    except Exception as e:
+        async with db_pool.acquire() as conn:   # откат, чтобы «пустое» голосование не блокировало новый запуск
+            await conn.execute("DELETE FROM vote_candidates WHERE session_id=$1", session_id)
+            await conn.execute("DELETE FROM vote_sessions WHERE id=$1", session_id)
+        return False, f"❌ Не удалось отправить в канал: {e}"
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE vote_sessions SET channel_message_id=$1, channel_chat_id=$2 WHERE id=$3",
+            msg.message_id, channel_id, session_id
+        )
+    timer_info = f" Закроется через {hours} ч." if hours else ""
+    return True, f"✅ Голосование «{_vote_short_label(vote_type, period)}» запущено! {len(tracks)} треков.{timer_info}"
+
+@dp.callback_query(F.data.startswith("vd_"))
+async def vd_callbacks(c: types.CallbackQuery, state: FSMContext):
+    if c.from_user.id != ADMIN_ID:
+        await c.answer("❌", show_alert=True)
+        return
+    parts = c.data.split("_")
+    action, did = parts[1], parts[2] if len(parts) > 2 else ""
+    d = VOTE_DRAFTS.get(did)
+    if not d:
+        await c.answer("⚠️ Черновик устарел (бот перезапускался). Запусти команду заново.", show_alert=True)
+        try:
+            await c.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    try:
+        if action == "rm":
+            tid = int(parts[3])
+            d['tracks'] = [t for t in d['tracks'] if t['id'] != tid]
+            await c.answer("Убрано")
+            await _vd_refresh(d)
+        elif action == "add":
+            if len(d['tracks']) >= VOTE_MAX_CANDIDATES:
+                await c.answer(f"Максимум {VOTE_MAX_CANDIDATES} треков. Сначала убери лишний.", show_alert=True)
+                return
+            await state.set_state(VoteDraftForm.waiting_query)
+            await state.update_data(did=did)
+            await c.answer()
+            await c.message.answer("🔍 Напиши название трека или исполнителя, которого добавить.\nОтмена: /cancel")
+        elif action == "pick":
+            tid = int(parts[3])
+            if any(t['id'] == tid for t in d['tracks']):
+                await c.answer("Этот трек уже в списке", show_alert=True)
+                return
+            if len(d['tracks']) >= VOTE_MAX_CANDIDATES:
+                await c.answer(f"Максимум {VOTE_MAX_CANDIDATES} треков", show_alert=True)
+                return
+            async with db_pool.acquire() as conn:
+                r = await conn.fetchrow("SELECT id, title, artist, plays FROM tracks WHERE id=$1", tid)
+            if not r:
+                await c.answer("❌ Трек не найден", show_alert=True)
+                return
+            d['tracks'].append(dict(r))
+            await state.clear()
+            await c.answer("Добавлено")
+            try:
+                await c.message.delete()
+            except Exception:
+                pass
+            await _vd_refresh(d)
+        elif action == "time":
+            await state.set_state(VoteDraftForm.waiting_hours)
+            await state.update_data(did=did)
+            await c.answer()
+            await c.message.answer("⏱ Через сколько часов закрыть голосование? Число от 1 до 720, или 0 — без таймера.\nОтмена: /cancel")
+        elif action == "pub":
+            ok, msg_text = await _vd_publish(d)
+            if ok:
+                VOTE_DRAFTS.pop(did, None)
+                await c.answer("Опубликовано")
+                try:
+                    await c.message.edit_text(msg_text)
+                except Exception:
+                    pass
+            else:
+                await c.answer(msg_text, show_alert=True)
+        elif action == "cancel":
+            VOTE_DRAFTS.pop(did, None)
+            await state.clear()
+            await c.answer("Отменено")
+            try:
+                await c.message.edit_text("✖️ Предпросмотр отменён, в канал ничего не отправлено.")
+            except Exception:
+                pass
+        else:
+            await c.answer()
+    except Exception as e:
+        logging.error(f"Ошибка в vd_callbacks: {e}")
+        await c.answer("❌ Ошибка", show_alert=True)
+
+@dp.message(VoteDraftForm.waiting_query, F.text & ~F.text.startswith("/"))
+async def vd_query_msg(m: types.Message, state: FSMContext):
+    if m.from_user.id != ADMIN_ID:
+        return
+    data = await state.get_data()
+    d = VOTE_DRAFTS.get(data.get("did"))
+    if not d:
+        await state.clear()
+        await m.answer("⚠️ Черновик устарел. Запусти команду заново.")
+        return
+    res, _ = await run_search(m.text.strip(), limit=8)
+    have = {t['id'] for t in d['tracks']}
+    res = [r for r in res if r['id'] not in have]
+    if not res:
+        await m.answer("😕 Ничего не нашлось (или эти треки уже в списке). Попробуй другой запрос или /cancel")
+        return
+    rows = [[InlineKeyboardButton(
+        text="➕ " + format_track(r['artist'], r['title'])[:55],
+        callback_data=f"vd_pick_{d['id']}_{r['id']}"
+    )] for r in res]
+    await m.answer("Выбери трек, чтобы добавить:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+@dp.message(VoteDraftForm.waiting_hours, F.text & ~F.text.startswith("/"))
+async def vd_hours_msg(m: types.Message, state: FSMContext):
+    if m.from_user.id != ADMIN_ID:
+        return
+    data = await state.get_data()
+    d = VOTE_DRAFTS.get(data.get("did"))
+    if not d:
+        await state.clear()
+        await m.answer("⚠️ Черновик устарел. Запусти команду заново.")
+        return
+    txt = (m.text or "").strip()
+    if not txt.isdigit() or int(txt) > 720:
+        await m.answer("❌ Введи число часов от 1 до 720, или 0 — без таймера.")
+        return
+    d['hours'] = int(txt) or None
+    await state.clear()
+    await _vd_refresh(d)
+    await m.answer("✅ Таймер обновлён")
+
+_MENU_TEXTS = set()
+for _k in ("b_search", "b_random", "b_top", "b_new", "b_fav", "b_pl", "b_donate", "b_lang"):
+    _MENU_TEXTS |= btn_all(_k)
+_MENU_TEXTS.add("⭐️ Купить Stars")
+
+@dp.message(F.chat.type == "private", F.text & ~F.text.startswith("/") & ~F.text.in_(_MENU_TEXTS))
 async def search(m: types.Message, state: FSMContext):
     cur = await state.get_state()
-    if cur in (PlaylistForm.waiting_name, BroadcastForm.waiting_text, DonateForm.waiting_amount, RequestForm.waiting_text, BuyStarsForm.waiting_amount):
+    if cur in (PlaylistForm.waiting_name, BroadcastForm.waiting_text, DonateForm.waiting_amount, RequestForm.waiting_text, BuyStarsForm.waiting_amount,
+               VoteDraftForm.waiting_query, VoteDraftForm.waiting_hours):
         return
     q = m.text.strip()
     if not q: return
@@ -2083,16 +2548,12 @@ async def search(m: types.Message, state: FSMContext):
     res, total = await run_search(q, offset=0)
     if total == 0:
         await log_missed_search(q, m.from_user.id)
-        await m.answer(
-            f"😕 По запросу <b>«{html.escape(q[:50])}»</b> ничего не нашлось.\n\n"
-            "Попробуй другое написание, часть названия или только имя исполнителя.",
-            parse_mode="HTML"
-        )
+        await m.answer(tr(m.from_user.id, "nothing_found", q=html.escape(q[:50])), parse_mode="HTML")
         return
     ids = [r['id'] for r in res]
-    h = build_search_text(q, total, 0, res)
+    h = build_search_text(q, total, 0, res, m.from_user.id)
     kb_rows = num_buttons(ids)
-    nav_kb = build_search_keyboard(q, 0, total)
+    nav_kb = build_search_keyboard(q, 0, total, m.from_user.id)
     kb_rows += nav_kb.inline_keyboard
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     await m.answer(h, reply_markup=kb, parse_mode="HTML")
@@ -2122,11 +2583,12 @@ async def _inline_allowed(user_id: int) -> bool:
 @dp.inline_query()
 async def inline_search(iq: types.InlineQuery):
     try:
+        ilang = await get_lang(iq.from_user)
         if not await _inline_allowed(iq.from_user.id):
             await iq.answer(
                 [], cache_time=5, is_personal=True,
                 button=InlineQueryResultsButton(
-                    text="🔒 Только для подписчиков — открыть бота", start_parameter="sub"
+                    text=tr(ilang, "inl_sub"), start_parameter="sub"
                 ),
             )
             return
@@ -2153,7 +2615,7 @@ async def inline_search(iq: types.InlineQuery):
         markup = None
         if BOT_USERNAME:
             markup = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="🎧 Больше музыки в боте", url=f"https://t.me/{BOT_USERNAME}")
+                InlineKeyboardButton(text=tr(ilang, "inl_more"), url=f"https://t.me/{BOT_USERNAME}")
             ]])
         results = [
             InlineQueryResultCachedAudio(id=str(tid), audio_file_id=files[tid], reply_markup=markup)
@@ -2163,7 +2625,7 @@ async def inline_search(iq: types.InlineQuery):
         button = None
         if not results and offset == 0:
             button = InlineQueryResultsButton(
-                text="😕 Ничего не нашлось — открыть бота", start_parameter="none"
+                text=tr(ilang, "inl_none"), start_parameter="none"
             )
         await iq.answer(
             results, cache_time=10, is_personal=True, next_offset=next_offset, button=button
@@ -2189,6 +2651,34 @@ async def inline_chosen(res: types.ChosenInlineResult):
     except Exception as e:
         logging.warning(f"Не удалось засчитать inline-прослушивание: {e}")
 
+@dp.message(F.text.in_(btn_all("b_lang")))
+@dp.message(Command("language"))
+async def lang_cmd(m: types.Message, state: FSMContext):
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang_ru"),
+        InlineKeyboardButton(text="🇬🇧 English", callback_data="lang_en"),
+    ]])
+    await m.answer(tr(m.from_user.id, "lang_choose"), reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("lang_"))
+async def lang_set_cb(c: types.CallbackQuery):
+    lang = c.data[5:]
+    if lang not in LANGS:
+        await c.answer()
+        return
+    try:
+        await set_user_lang(c.from_user.id, lang)
+        await c.answer()
+        try:
+            await c.message.delete()
+        except Exception:
+            pass
+        await c.message.answer(tr(lang, "lang_set"), reply_markup=get_menu(lang))
+    except Exception as e:
+        logging.error(f"Ошибка смены языка: {e}")
+        await c.answer(tr(c.from_user.id, "err"), show_alert=True)
+
 @dp.callback_query(F.data == "noop")
 async def noop(c: types.CallbackQuery):
     await c.answer()
@@ -2202,22 +2692,22 @@ async def page_nav(c: types.CallbackQuery):
         q = raw[sep+1:]
         res, total = await run_search(q, offset=offset)
         if total == 0:
-            await c.answer("❌ Ничего не найдено", show_alert=True)
+            await c.answer(tr(c.from_user.id, "nf_alert"), show_alert=True)
             return
         if not res:
-            await c.answer("❌ Страница не найдена", show_alert=True)
+            await c.answer(tr(c.from_user.id, "nopage"), show_alert=True)
             return
         ids = [r['id'] for r in res]
-        h = build_search_text(q, total, offset, res)
+        h = build_search_text(q, total, offset, res, c.from_user.id)
         kb_rows = num_buttons(ids)
-        nav_kb = build_search_keyboard(q, offset, total)
+        nav_kb = build_search_keyboard(q, offset, total, c.from_user.id)
         kb_rows += nav_kb.inline_keyboard
         kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
         await c.message.edit_text(h, reply_markup=kb, parse_mode="HTML")
         await c.answer()
     except Exception as e:
         logging.error(f"Ошибка в page_nav: {e}")
-        await c.answer("❌ Ошибка", show_alert=True)
+        await c.answer(tr(c.from_user.id, "err"), show_alert=True)
 
 @dp.message(Command("mg"))
 async def mg_cmd(m: types.Message):
@@ -2484,6 +2974,7 @@ def build_vote_keyboard(session_id: int, rows, closed=False) -> InlineKeyboardMa
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 async def _start_vote(m: types.Message, vote_type: str, limit: int, hours: int = None, artist: str = None):
+    """Готовит голосование и присылает админу предпросмотр. В канал публикуется после кнопки «Опубликовать»."""
     if m.from_user.id != ADMIN_ID: return
     channel_id = get_channel_id()
     if not channel_id:
@@ -2517,41 +3008,13 @@ async def _start_vote(m: types.Message, vote_type: str, limit: int, hours: int =
             tracks = await _fetch_vote_tracks(conn, cands[0], limit)
         else:
             tracks = await conn.fetch(
-                "SELECT id, title, artist FROM tracks ORDER BY plays DESC LIMIT $1", limit
+                "SELECT id, title, artist, plays FROM tracks ORDER BY plays DESC NULLS LAST, id LIMIT $1", limit
             )
         if len(tracks) < 2:
             who = f"у {html.escape(canonical_artist)}" if canonical_artist else "в базе"
             await m.answer(f"❌ Мало треков {who} (нужно минимум 2)")
             return
-        await conn.execute(
-            "DELETE FROM vote_sessions WHERE vote_type=$1 AND period=$2 AND status<>'active'",
-            vote_type, period
-        )
-        closes_at = datetime.datetime.utcnow() + datetime.timedelta(hours=hours) if hours else None
-        session_id = await conn.fetchval(
-            "INSERT INTO vote_sessions (vote_type, period, closes_at) VALUES ($1, $2, $3) RETURNING id",
-            vote_type, period, closes_at
-        )
-        await conn.executemany(
-            "INSERT INTO vote_candidates (session_id, track_id) VALUES ($1, $2)",
-            [(session_id, t['id']) for t in tracks]
-        )
-    rows = await get_vote_counts(session_id)
-    text = build_vote_text(vote_type, period, rows, closes_at=closes_at, created_at=datetime.datetime.utcnow())
-    kb = build_vote_keyboard(session_id, rows)
-    try:
-        msg = await bot.send_message(channel_id, text, parse_mode="HTML", reply_markup=kb)
-    except Exception as e:
-        await m.answer(f"❌ Не удалось отправить в канал: {e}")
-        return
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE vote_sessions SET channel_message_id=$1, channel_chat_id=$2 WHERE id=$3",
-            msg.message_id, channel_id, session_id
-        )
-    label_name = _vote_short_label(vote_type, period)
-    timer_info = f" Закроется через {hours}ч." if hours else ""
-    await m.answer(f"✅ Голосование «{html.escape(label_name)}» запущено! {len(tracks)} треков.{timer_info}", parse_mode="HTML")
+    await _vd_create_and_show(m, vote_type, period, canonical_artist, hours, tracks)
 
 async def _do_close_vote(session: dict):
     """Закрыть голосование по объекту сессии (используется вручную и авто-таймером)."""
@@ -2877,13 +3340,13 @@ async def _fetch_vote_tracks(conn, cand, limit: int):
         where = ' OR '.join(where_parts)
         params.append(limit)
         return await conn.fetch(
-            f"SELECT id, title, artist FROM tracks WHERE {where} "
-            f"ORDER BY plays DESC, id LIMIT ${len(params)}",
+            f"SELECT id, title, artist, plays FROM tracks WHERE {where} "
+            f"ORDER BY plays DESC NULLS LAST, id LIMIT ${len(params)}",
             *params
         )
     return await conn.fetch(
-        "SELECT id, title, artist FROM tracks WHERE artist=$1 "
-        "ORDER BY plays DESC, id LIMIT $2",
+        "SELECT id, title, artist, plays FROM tracks WHERE artist=$1 "
+        "ORDER BY plays DESC NULLS LAST, id LIMIT $2",
         cand['artist'], limit
     )
 
@@ -3043,39 +3506,7 @@ async def start_artist(m: types.Message):
         if len(tracks) < 2:
             await m.answer(f"❌ У {html.escape(canonical)} меньше 2 треков в базе")
             return
-        await conn.execute(
-            "DELETE FROM vote_sessions WHERE vote_type='artist' AND period=$1 AND status<>'active'",
-            canonical
-        )
-        closes_at = datetime.datetime.utcnow() + datetime.timedelta(hours=hours) if hours else None
-        session_id = await conn.fetchval(
-            "INSERT INTO vote_sessions (vote_type, period, closes_at) "
-            "VALUES ('artist', $1, $2) RETURNING id",
-            canonical, closes_at
-        )
-        await conn.executemany(
-            "INSERT INTO vote_candidates (session_id, track_id) VALUES ($1, $2)",
-            [(session_id, t['id']) for t in tracks]
-        )
-    rows = await get_vote_counts(session_id)
-    text = build_vote_text('artist', canonical, rows, closes_at=closes_at)
-    kb = build_vote_keyboard(session_id, rows)
-    try:
-        msg = await bot.send_message(channel_id, text, parse_mode="HTML", reply_markup=kb)
-    except Exception as e:
-        await m.answer(f"❌ Не удалось отправить в канал: {e}")
-        return
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE vote_sessions SET channel_message_id=$1, channel_chat_id=$2 WHERE id=$3",
-            msg.message_id, channel_id, session_id
-        )
-    timer_info = f" Закроется через {hours}ч." if hours else ""
-    await m.answer(
-        f"✅ Голосование «Лучшие треки {html.escape(canonical)}» запущено! "
-        f"{len(tracks)} треков (по числу прослушиваний).{timer_info}",
-        parse_mode="HTML"
-    )
+    await _vd_create_and_show(m, 'artist', canonical, canonical, hours, tracks)
 
 @dp.message(Command("closeartist"))
 async def close_artist(m: types.Message):
@@ -3183,7 +3614,7 @@ async def handle_vote(c: types.CallbackQuery):
         async with pool.acquire() as conn:
             session = await conn.fetchrow("SELECT * FROM vote_sessions WHERE id=$1", session_id)
             if not session or session['status'] != 'active':
-                await c.answer("❌ Голосование уже закрыто", show_alert=True)
+                await c.answer(tr(c.from_user.id, "v_closed"), show_alert=True)
                 return
             existing = await conn.fetchval(
                 "SELECT track_id FROM votes WHERE session_id=$1 AND user_id=$2",
@@ -3191,16 +3622,16 @@ async def handle_vote(c: types.CallbackQuery):
             )
             if existing is not None:
                 if existing == track_id:
-                    await c.answer("Ты уже голосовал за этот трек", show_alert=True)
+                    await c.answer(tr(c.from_user.id, "v_same"), show_alert=True)
                 else:
-                    await c.answer("Ты уже проголосовал в этом голосовании", show_alert=True)
+                    await c.answer(tr(c.from_user.id, "v_already"), show_alert=True)
                 return
             is_candidate = await conn.fetchval(
                 "SELECT 1 FROM vote_candidates WHERE session_id=$1 AND track_id=$2",
                 session_id, track_id
             )
             if not is_candidate:
-                await c.answer("❌ Трек не найден", show_alert=True)
+                await c.answer(tr(c.from_user.id, "not_found"), show_alert=True)
                 return
             await conn.execute(
                 "INSERT INTO votes (session_id, track_id, user_id) VALUES ($1, $2, $3)",
@@ -3215,11 +3646,11 @@ async def handle_vote(c: types.CallbackQuery):
         except Exception:
             pass
         voted_row = next((r for r in rows if r['track_id'] == track_id), None)
-        name = html.escape(format_track(voted_row['artist'], voted_row['title'])) if voted_row else "трек"
-        await c.answer(f"✅ Голос за «{name}» засчитан!", show_alert=True)
+        name = html.escape(format_track(voted_row['artist'], voted_row['title'])) if voted_row else tr(c.from_user.id, "v_track")
+        await c.answer(tr(c.from_user.id, "v_ok", name=name), show_alert=True)
     except Exception as e:
         logging.error(f"Ошибка в handle_vote: {e}")
-        await c.answer("❌ Ошибка", show_alert=True)
+        await c.answer(tr(c.from_user.id, "err"), show_alert=True)
 
 # --- ПРОДАЖА STARS ---
 
@@ -3315,7 +3746,7 @@ async def starbuy_preset(c: types.CallbackQuery, state: FSMContext):
     try:
         amount = int(val)
     except ValueError:
-        await c.answer("❌ Ошибка", show_alert=True)
+        await c.answer(tr(c.from_user.id, "err"), show_alert=True)
         return
     rate_str = await _get_setting("star_rate")
     payment_info = await _get_setting("star_payment")
@@ -3617,7 +4048,7 @@ async def _request_limit_status(conn, session_id: int, user_id: int):
     )
     if total and total >= MAX_REQUESTS_PER_SESSION:
         return ("session_full",
-                "❌ Лимит заявок в этой сессии исчерпан. Жди следующего поста.")
+                tr(user_id, "req_full"))
     if user_id:
         from_user = await conn.fetchval(
             "SELECT COUNT(*) FROM track_requests "
@@ -3626,9 +4057,8 @@ async def _request_limit_status(conn, session_id: int, user_id: int):
         )
         if from_user and from_user >= MAX_REQUESTS_PER_USER:
             return ("user_limit",
-                    f"❌ Ты уже отправил {MAX_REQUESTS_PER_USER} "
-                    f"{'заявку' if MAX_REQUESTS_PER_USER == 1 else 'заявки'} "
-                    f"в этой сессии — это максимум.")
+                    tr(user_id, "req_user_limit", n=MAX_REQUESTS_PER_USER,
+                       word=tr(user_id, "req_word_one" if MAX_REQUESTS_PER_USER == 1 else "req_word_many")))
     return (None, None)
 
 @dp.message(Command("askreq"))
